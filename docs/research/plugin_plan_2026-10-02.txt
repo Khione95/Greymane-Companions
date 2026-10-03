@@ -1,0 +1,384 @@
+GREYMANE COMPANIONS: PLAN FOR THE PLUGIN (ASI)
+Build: CrimsonDesert.exe with PE TimeDateStamp 0x6AB28F00 and SizeOfImage 0x173AB000. This is the same build as CharacterCreator's KNOWN_TIMESTAMP and KNOWN_IMAGE_SIZE in addresses.cpp. Image base 0x140000000.
+How the work was done: static only. I did not run the game and did not touch the game folder.
+New checks made this session (helpers are in scratchpad\gca\, results in plan_aob.txt):
+- the server thread entry and the pump
+- the owned-mercenary list
+- the argument forms of disband and remove
+- the Ack arguments
+- the position getter
+- unique AOBs for every function to be hooked
+
+All functions are Microsoft x64 __fastcall: rcx, rdx, r8, r9, then the stack from [rsp+0x28]. Every function listed is plain code in the first section unless it is marked PROTECTED.
+
+======================================================================
+1. MINIMAL SET OF GAME FUNCTIONS AND OBJECTS
+======================================================================
+
+Version check: use the same scheme as CharacterCreator addresses.cpp.
+- If the timestamp and image size match, use the known RVAs, but only after a memcmp of the prologue bytes below.
+- Otherwise, scan for the AOBs.
+- Find vtables through their RTTI names.
+- Functions with a non-unique prologue are reached by decoding a call or rip instruction at a known offset inside a function that does have a unique AOB.
+- If any item fails, the plugin installs nothing and writes a log line. It never falls back to blind RVAs.
+
+A) Core calls (server thread only)
+
+AccompanyMercenary, 0x2150930. Makes a hired comrade follow (adds him to the accompany list).
+- Signature: u32* fn(MercClan* clan rcx, u32* outErr rdx, VecRef* keys r8, VecRef* outPairs r9). It returns rdx.
+- Struct layouts:
+  - VecRef = {InlineVec* a; InlineVec* b;}. The function uses a when it is non-null. Neither r9 nor the chosen side may be null.
+  - InlineVec<T> = {T* data; u32 count; u32 cap; T inline[] at +0x10}.
+  - keys: u32 CharacterKeys = {control character key, comrade key}. Pass data=&inline, count=2, cap=4.
+  - outPairs: u64 entries {charKey, actorKey}, one for each NEW non-control entry (checked at 0x2151070..0x21511CF). Pass an InlineVec<u64> with cap 4. When count reaches cap, the grow path calls the protected stub 0x392380, so never let it fill.
+- Effect: each new entry is {u16 idx, u32 actorKey, u8 type = 2 FollowOffensive, u64 mercNo}. Then:
+  - vt+0x150 (0x2B98830) re-arms a spawned comrade (0x21514A0) or summons him near the leader (0x2BA9340).
+  - vt+0x158 (0x2B98D10) sends packet 0x9FB, so the client clan updates by itself.
+- AOB: 48 89 5C 24 18 4C 89 4C 24 20 48 89 54 24 10 55 56 57 41 54 41 55 41 56 41 57 48 8D 6C 24 F0
+
+SetAccompanyType, 0x21523A0. Switches an existing entry between Follow and Standby.
+- Signature: bool fn(MercClan* rcx, u16 charIdx dx, u8 type r8b). Types: 1 Wait, 2 FollowOffensive, 3 FollowDefensive, 4 Follow.
+- It edits an EXISTING entry only. It returns 0 if there is no entry, and it sends no sync.
+- AOB: 48 89 5C 24 08 48 89 6C 24 18 48 89 74 24 20 57 48 83 EC 30 41 0F B6 E8
+
+GetAccompanyType, 0x21524C0. Reads an entry's type.
+- Signature: bool fn(MercClan* rcx, u16 idx dx, u8* out r8).
+- It takes the clan lock. CheckAccompanyType 0x22A4E80 calls it on both client and server, so it is safe in condition context.
+- AOB: 48 89 5C 24 10 48 89 74 24 18 48 89 7C 24 20 41 56 48 83 EC 20 4D 8B F0 0F B7 DA
+
+SendSetAccompanyTypeAck, 0x297EF40. Tells the client about a type change (packet 0x940). It has no unique prologue: take it from the E8 at 0x2AC9270+0x154.
+- Signature: void fn(Actor* leader rcx, Finder* rdx, CharacterInfo* r8, u8* type r9).
+- r8 is the pointer returned by 0x389570, exactly as at 0x2AC9377..0x2AC93C4.
+- Finder = {vt = base+0x5B25438 (RTTI .?AVToTargetSendTargetFinder@pa@@); u8 0 at +8; u64 at +0x10 = leader->vt[0xE8](leader)}.
+- It writes into [TLS+0x250], the server send buffer.
+
+DisbandByKeys, 0x2BA10A0. Takes a comrade out of the accompany list. This is the server body of the vanilla TrocTrDisbandMercenaryReq (handler 0x2A33000).
+- Signature: u32* fn(MercClan* rcx, u32* err rdx, Span<u32>* keys r8). Span = {u32* data; u32 count; u32 cap}; the count is read at [r8+8] (0x2BA10D5).
+- It maps keys to indexes, then calls 0x2151570(clan, err, &Span<u16>, 1, 0, 0, 0).
+- 0x2151570 also reads a plain span with the count at +8 (0x2151696). It ends in the protected vt+0x178 0x2B98D90, so its client sync is unverified.
+- The comrade stays hired.
+- AOB: 48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57 41 54 41 55 41 56 41 57 48 83 EC 60 4D 8B F8
+
+HireActor, 0x2BADC00. Recruit, for story Greymanes only.
+- Signature: u32* fn(MercClan* rcx, u32* err rdx, u32* actorKey r8, void* r9 = 0, u8 flag [rsp+0x20] = 0). This is the same call that TrocTrHireMercenaryToTargetReq 0x2A2F160 makes.
+- It LOGS OUT the world actor and spawns a mercenary copy.
+- AOB: 48 89 5C 24 10 4C 89 44 24 18 55 56 57 41 54 41 55 41 56 41 57 48 8D 6C 24 C0 48 81 EC 40 01 00 00 45 0F B6 E9
+
+B) Lookups
+
+CharacterInfoByIndex, 0x389570. Turns a u16 index into a CharacterInfo*; the first u32 of the record is the CharacterKey.
+- Signature: CharacterInfo* fn(const u16* idx rcx).
+- Take it from the E8 at 0x2150930+0x335.
+
+InteractionInfo by index, 0x3888B0. A PROTECTED E9 stub, but it is safe to CALL.
+- Signature: II* fn(const u16* idx); the first u32 of the record is the interaction key.
+- Take it from the E8 at 0x2B36EF0+0xBE (0x2B36FAE).
+
+ServerActorManager::findActor, 0x2A82370. Finds a server actor by actor key.
+- Signature: Scope* fn(mgr rcx, Scope* out rdx, u32 actorKey r8d).
+- Scope is 0x20 bytes: {vt; Actor* +8; u8 acquired +0x10; u8 mode +0x11; u64}.
+- Release it with 0x1434880(&scope), the call used at 0x2AC9336. AOB of 0x1434880: 48 89 5C 24 10 48 89 74 24 18 57 48 83 EC 20 48 8B F1 80 79 10 00
+- Get findActor from the RTTI .?AVServerActorManager@pa@@ vtable (0x5B25988) slot +0x28, or from the E8 at 0x29E8FA0+0x24C.
+- The manager:
+  - mgr = *(*(u64*)(base+0x6D694E0) + 0x10). This is the server world context, selected with cmovne at 0x2B98830+0xE2.
+  - Or mgr = **(u64**)(base+0x6D69698), the server-only form used by 0x29E8FA0+0x242.
+  - Check the manager's vtable == ServerActorManager at runtime and log whether the two forms agree.
+
+Position getter, 0x4F8220. Used to find the nearest comrade.
+- Signature: Pos16* fn(posComp = [[actor+0x68]+0x1A0] rcx, Pos16* out rdx).
+- Pos16 = {f32 x, y, z; i16 sectorX, sectorZ}. World x = x + sectorX*1000 and z = z + sectorZ*1000. This is the same maths 0x2B98830 uses with the constant 1000 at 0x5D736F4.
+- AOB: 40 53 48 81 EC 80 00 00 00 8B 81 BC 00 00 00
+
+C) Objects and offsets
+
+Actor fields:
+- +0x60 u32 actorKey. The key is the same on client and server: 0x2A2BDF0 sends [owner+0x60] and the client's 0xBEBEA0 looks it up.
+- +0x68 component table:
+  - +0x20 character holder (u16 CharacterInfo index at +0x30)
+  - +0x98 interaction component
+  - +0x110 mercenary clan
+  - +0x1A0 position component
+- +0x88 -> kind byte at +1 (0 = user, 1 = character, 7 = gimmick)
+- +0xA0 -> UserActor:
+  - +0xD0 = the clan-holding owner. Confirmed in 0x17EE020: mov rdi,[rcx+0xA0]; mov rdi,[rdi+0xD0].
+  - +0xD8 = the control actor. Confirmed in 0x206AE30.
+
+Server clan:
+- clan = [[owner+0x68]+0x110]. Its vtable must be base+0x5B2C6C8 (.?AVServerMercenaryClanActorComponent@pa@@); the client one is 0x55BE900.
+- [clan+8] = owner.
+- Owned mercenaries: clan+0x18 = Record**, count u32 at clan+0x20. Record fields: +0x20 u16 charIdx (0xFFFF = invalid), +0x28 u64 mercNo (-1 = invalid), +0x50 u32 actorKey (0 = not spawned).
+  - Checked this session in the walk at 0x2151915..0x2151975; the default record is at 0x6CF2F50.
+  - Walking this list lets the plugin check ownership without the protected 0x214E7A0.
+- Accompany list: clan+0xB8 data, +0xC0 count, +0xC4 capacity. Entries are 0x18 bytes: {u16 idx; u32 actorKey +4; u8 type +8; u64 mercNo +0x10}.
+- Remembered list: clan+0xE8 (u32 keys), count at +0xF0.
+
+Client self character:
+- root = *(u64*)(base+0x6D69190); holder = *(root+0x30); selfChar = *(holder+0x50); selfUser = *(holder+0x58).
+- Find the global through the 0x8B4700 callers ("mov rcx,[rip+X]; mov rcx,[rcx+30h]; call"), for example at 0x65DBB0.
+
+CharacterInfo manager:
+- *(u64*)(base+0x6D69A48), from the mov r11,[rip] at 0x2150930+0x212.
+- Key to index: +0x68 bucket count, +0x78 buckets of 0x100 bytes {u32 n; {u32 key, u32 rec}...}, +0x80 records (rec+4 key, rec+8 u16 idx).
+
+TLS:
+- t = *(u64*)__readgsqword(0x58).
+- *(u8*)(t+0x1EC) != 0 on a server thread. This session confirmed that 0x2773390 writes 1 there and then jumps to the server loop 0x27733F0.
+- +0x1FD selects the allocator; +0x250 holds the send buffer.
+
+Error globals (u32, filled at runtime; compare with *err):
+- 0x6CF6EBC NotFoundFocusActor
+- 0x6CF71A0 NoInvalidCharacterInfo
+- 0x6CF6F50 NoInvalidMercenaryData
+- 0x6CF7E98 NoEmptyCalledMercenaryList
+
+D) Hooks (MinHook, plain code only)
+
+H0, the server pump: ServerMsgDispatch 0x2773C20.
+- Signature: (ctx rcx, out rdx, r8, payload r9, u16 [rsp+0x28], u8 [rsp+0x30]). Declare the last two as u64 so they are forwarded unchanged.
+- Its only caller is 0x27735D3, inside the server worker loop 0x27733F0. That loop waits on a queue with a 1000 ms timeout and calls this function once per client packet, holding no game lock. Its only state is the thread's own pause flag at TLS+0x4460.
+- At entry: check TLS+0x1EC, drain the plugin's command queue (single consumer, InterlockedExchange), then call the original.
+- AOB: 48 89 5C 24 10 4C 89 4C 24 20 48 89 4C 24 08 55 56 57 41 54 41 55 41 56 41 57 48 8D 6C 24 E9 48 81 EC B0 00 00 00
+
+H1, "the player used option X on NPC Y" (server): TryPreempt 0x2B36EF0. Details in section 2.
+- AOB: 48 89 5C 24 10 66 44 89 4C 24 20 55 56 57 41 54 41 55 41 56 41 57 48 8D 6C 24 F9
+- Its only caller is in .xtls (the body of stub 0x2B36860). Do not hook that stub.
+
+H2, prompt visibility: CheckInteractionConditions 0x21206C0.
+- Signature: void(self rcx, Actor* target rdx, const u16* iidx r8, u8 mode r9b, CheckResult* out [rsp+0x28]).
+- CheckResult is 16 bytes: {u8 state (the caller presets 2 = ok); u32 err; u32 failIdx; u8 inOverrideList}. The function writes it only on failure.
+- mode 0 = client UI, 3 = server execution.
+- AOB: 4C 8B DC 49 89 5B 10 49 89 6B 18 49 89 73 20 57 41 54 41 55 41 56 41 57 48 83 EC 60 45 0F B6 E1
+
+H3, only if needed: CollectInteractions 0x2123710.
+- Signature: (targetComp rcx, u8 useDynamic dl, Vec* out r8). Entries are 0x30 bytes with the defaults from the interaction report.
+- At 0x2123B97 ("cmp [rsi+8],0; jne") the CharacterInfo interaction_info_list is read ONLY when the AI-state, dynamic or gimmick lists produced nothing.
+- AOB: 48 89 5C 24 08 55 56 57 41 54 41 55 41 56 41 57 48 8D 6C 24 D9 48 81 EC 90 00 00 00 49 8B F0 84 D2
+
+Not to hook (PROTECTED stubs; call them only):
+- 0x214E7A0
+- 0x2B36860
+- 0x3888B0
+- 0x2049B90
+- 0x2B98D90
+- 0x2C3AE20
+- 0x9E4840
+- 0x2125660
+- 0x211E1C0
+
+======================================================================
+2. HOOK POINT FOR "PLAYER CHOSE AN OPTION", AND THE FLOW
+======================================================================
+
+Path of a choice: the client sends TrInteractionPreemptionStepReq (from protected client code). Then, on the server:
+0x2773C20 -> 0x29E8FA0 (handler, vt 0x5B238D8 slot 0x10) -> 0x2B36860 (stub) -> body -> 0x2B36EF0.
+
+0x2B36EF0 arguments:
+- self = ServerInteractionActorComponent, rcx; [self+8] = the player's server actor
+- u32* result, rdx; 0 = ok
+- Actor* target, r8
+- u16 interactionIndex, r9w
+- pivot, [rsp+0x28]
+- f5, [rsp+0x30]
+- f7ptr, [rsp+0x38]
+- CheckResult* out, [rsp+0x40]
+
+Later, the step machine 0x211DA30 raises pivot+0x64 (the AI event, for example f5bfee82 for Follow) on the target's AI.
+
+H1 logic:
+1. Call the original.
+2. If *result == 0:
+   - key = *(u32*)GetII(&iidx)
+   - tKey = *(u32*)CharInfo(&[[target+0x68]+0x20]+0x30)
+   - Continue only if tKey is in the roster and the target is a character (kind 1).
+3. Push {action, player actorKey [player+0x60], target actorKey [target+0x60], tKey} into the queue.
+4. Do NOT call clan functions inside H1. The caller is protected code whose locks are unknown, and 0x2150930 takes the owner's RW lock (0x393650). The action runs at the next H0 entry, a few milliseconds later, because the interaction's own next step packets follow at once.
+
+Pump execution:
+1. player = findActor(mgr, playerKey)
+2. owner = [[player+0xA0]+0xD0]
+3. clan = [[owner+0x68]+0x110]; check its vtable
+4. control = [[owner+0xA0]+0xD8]
+5. controlKey = *(u32*)CharInfo(&[[control+0x68]+0x20]+0x30)
+6. idx = the comrade's u16 index (from the hash or from the record)
+
+State flow (vanilla keys; the roster comes from the plugin's ini):
+
+a) Recruit (Npc_Employ 0xF4292, or a clone), when the target is NOT owned (no clan+0x18 record with this idx):
+   - Camp comrades are already hired, so this step does nothing for them.
+   - For story Greymanes: HireActor(clan, &err, &targetActorKey, 0, 0). The characterinfo mercenary type must be set by the data in approach B, or the hire fails with CantHireMercenaryToTarget.
+   - After the hire, the world actor is logged out. The new actor is read from record+0x50 (0 if not yet spawned).
+   - Alternative: the data-only Recruit through the "Mercenary(<char>)" drop set reward, already prepared in Test 3.
+
+b) Follow, when the comrade is owned and not in clan+0xB8:
+   - AccompanyMercenary(clan, &err, {&{data,2,4,[controlKey,tKey]},0}, {&{data,0,4},0}).
+   - Expect err == 0. The game summons or re-arms him and sends 0x9FB.
+   - The client clan then holds type 2, so CheckAccompanyType returns 2 on the client:
+     - vanilla Standby (0xF4253, needs 2 or 3) shows
+     - Follow_Defensive (0xF4315, needs 2 or 1) shows
+     - vanilla Follow (needs 1 or 3) hides
+
+c) Follow, when he is in the list with type 1:
+   - SetAccompanyType(clan, idx, 2), then SendSetAccompanyTypeAck(owner, &finder, CharInfo(&idx), &type).
+
+d) Standby, when the type is 2, 3 or 4:
+   - SetAccompanyType(clan, idx, 1) plus the Ack.
+   - The Standby event eebe079c also reaches his chart (handler 0x21D), which probably does the same through 0x2AC9270. Both writes give the same value, so doing it twice is harmless.
+
+e) Disband, when he is in the list:
+   - DisbandByKeys(clan, &err, &{&tKey,1,1}).
+   - He stays hired and is only removed from the accompany list. Do NOT use FireMercenary.
+
+H2 rules. They apply only when tKey is in the roster, so Damiane's and Oongka's own Follow and Standby stay vanilla.
+- Save the 16 bytes of *out, call the original, then decide.
+- On the client (mode 0), use the client clan through the same chain on client actors; CheckAccompanyType already resolves it there. On the server (mode 3), use the server clan.
+  - Recruit: show only if not owned.
+  - Follow: show if owned and (not in the list, or type == 1).
+  - Standby: show if type is 2, 3 or 4.
+  - Disband: show if in the list.
+- To show: write the saved bytes back (state 2). To hide: set out->state = 0.
+- Mode 3 must also pass, otherwise 0x2B36EF0 rejects the choice through vt+0x170 (0x211FCB0 -> 0x21206C0).
+- Why H2 is needed:
+  - vanilla Follow hides on an unregistered comrade (0x197 type 1 or 3, with no entry)
+  - vanilla Disband requires CheckSameParty and the buff tag 0xC10DC139
+
+H3, only if the probe in section 3 shows that Morrow's offered list does not contain the data-added keys:
+- After the original call, append default 0x30-byte entries for the missing indexes (grow with 0x9C1410).
+- 0x2B36EF0 calls 0x2124060 first, which also requires the target to list the interaction.
+- Get the indexes from the InteractionInfo manager at [0x6D69AB8]: +0x68 bucket count, +0x78 buckets, +0x80 entries {+4 key, +8 u16 idx}.
+
+AI events: vanilla interactions still send their pivot+0x64 event to his chart:
+- Follow -> 0x21C
+- Standby -> 0x21D
+- Disband -> 0x21E (not decoded)
+For production, use DMM clones of the four interactions with pivot+0x64 = 0 and pivot+0x68 = 0, so that only the plugin acts. Keep the vanilla keys only for the first tests.
+
+======================================================================
+3. COULD A DATA-ONLY FOLLOW WORK?
+======================================================================
+
+Verdict: not for a real, lasting Follow. The evidence:
+- Only 0x2150930 creates an accompany entry. It has exactly two callers:
+  - the quest stage function 0x293DDE0 (server stage processor slot 0x120, StageChart_Function_AccompanyMercenary)
+  - the load/warp re-apply 0x2BC96C0, which only restores the remembered list clan+0xE8
+- No AIFunction creates entries. The relevant ones are FireMercenary, SetHyosi, SetAccompanyType and Party*.
+- 0x21523A0 returns 0 when there is no entry, while 0x2AC9270 still reports success. So an order event on an unregistered comrade fails silently. This matches Test 3.
+- The AI follow conditions read the clan entry: AICondition_CheckAccompany 0x22EA740 goes to 0x17EC1B0, which scans clan+0xB8.
+- The only data route left would be authoring a new .pastage/.paseqc that runs set_accompanyMercenary, plus a trigger. That format is only partly decoded.
+- What data already gives: temporary help in fights through Follow into Combat (Hyosi).
+
+What to test, so that "the data cannot do it" can be told apart from "the prompt never reached the NPC":
+
+T1 (data probe, test save only):
+- In Npc_Order_Follow 0xF4251, change byte +0x126 from 03 to 00.
+- The target tree becomes !Dead && (Acc==None || Acc==Wait) && !CCTime.
+- Side effect: Follow also shows on unregistered Main companions. It is harmless and only for the test build.
+- Results:
+  - Follow shows on Morrow: the interaction list is honoured and his leader resolves. Then press it:
+    - If he walks after you, his chart follows without an entry (handler 0x21C does not use the clan). That would be a limited data-only follow: not saved, with no Standby.
+    - If nothing happens, this confirms that the plugin must register him.
+  - Follow does not show: either his AI-state list replaces interaction_info_list (0x2123B97) or leader resolution fails. Only T2 can tell which.
+
+T2 (read-only probe in the plugin):
+- Log H3's output: the indexes and keys offered for the NPC the player is facing.
+- Log H2's verdicts: for each key, mode, out.state, out.err and failIdx.
+- Hooks that only log change nothing. This settles whether Test 3's additions were offered at all, and which condition hid them.
+- Free control: Morrow's vanilla list already has Npc_Hyosi_Add/Remove. If "Follow into Combat" shows on him in a save where Hyosi is unlocked (GameContentOpen_Hyosi 0xF4264), his CharacterInfo list is honoured.
+
+======================================================================
+4. RISKS
+======================================================================
+
+Threads:
+- 0x2150930, 0x21523A0 with 0x297EF40, 0x2BA10A0 and 0x2BADC00 must run on a server worker thread:
+  - TLS+0x1EC picks the world and actor manager
+  - TLS+0x1FD picks the heap (0x2151570 and 0x2BA10A0 allocate)
+  - TLS+0x250 is the send buffer
+- Running them from the input, render or client thread uses the wrong world or heap, or a null send buffer.
+- Rules:
+  - Do the work only in H0.
+  - Assert TLS+0x1EC == 1.
+  - Several server workers may exist (the loop 0x27733F0 is per thread), so the queue needs exactly one consumer.
+  - H0 only runs when a packet arrives (the loop waits up to 1 s). Log the calls per second, idle and moving. If it is too sparse, hook 0x2774730 as well: the task runner of the same loop, called at 0x2773562 with 4 callers in total. AOB: 48 89 5C 24 10 44 88 44 24 18 48 89 4C 24 08 55 56 57 41 54 41 55 41 56 41 57 48 8D 6C 24 D9
+- Hotkeys only set an atomic request.
+- Client objects (the self key, the client clan for dumps) are read inside __try/__except.
+- Production code acquires and releases actor scopes (0x1434880).
+
+Client/server sync:
+- Never write clan+0xB8 by hand.
+- The client applies 0x9FB only if no entry has idx 0xFFFF or actorKey 0 (the 0xBEC2D0 loop).
+- Type changes need the 0x940 Ack.
+- Disband sync goes through the protected 0x2B98D90 and is unverified: compare the client and server lists after F10.
+
+Vanilla AI side effects:
+- The Disband event handler 0x21E on the comrade charts is not decoded. It could fire the comrade, so the first Disband tests must use a clone with no event, or a spare comrade on a test save.
+- Morrow's camp chart may have no follow-leader branch: registered but standing still. Experiment 1 tests this.
+
+Saves and persistence:
+- It is unknown whether the accompany list is saved.
+- 0x2BC96C0 re-applies the remembered list on loading or focus change.
+- Plan: test save and reload. If the entry is lost, re-register on demand from a per-save roster.
+- Story stages force a dismissal ("Comrade Dismissal" popup 0x5CDDE0, then 0x5CE030 on vt+0x160). Regions have _isAccompanyAllowed, which triggers UI_Alert_ForceDisbandAccompanyNotAllowedRegion. Recommend "Companions Everywhere".
+- A camp schedule may pull the comrade back to camp.
+
+Recruiting story NPCs:
+- HireActor logs out the world actor, so quests that need Naira or Yann present may break.
+- Start with camp comrades only.
+
+Protected code:
+- Call stubs, never hook them. 0x2150930 itself calls 0x214E7A0; that is fine because the game makes the call.
+- Code-integrity checks on hooked plain code: CharacterCreator's MinHook detours on first-section code are a working precedent. Keep the 9.1.11 lessons on antivirus false alarms.
+
+Game updates:
+- Gate on the timestamp and size, then fall back to AOB, RTTI and call-site decoding as listed in section 1. Refuse to hook on any mismatch.
+- The struct offsets (+0xA0/+0xD0/+0xD8, clan+0x18/+0xB8, the Scope layout) are not covered by AOBs. Re-check them through the anchors 0x17EE020, 0x206AE30 and 0x2151915.
+
+======================================================================
+5. FIRST IN-GAME EXPERIMENT (smallest useful)
+======================================================================
+
+What it contains:
+- A GreymaneCompanions.asi with the version check, the H0 pump only, two hotkeys and a log file.
+- Optional (read-only): the T2 logging hooks H2 and H3, built as a separate switch.
+
+Setup:
+- A test save with Morrow (0xF4DD8) hired at camp.
+- Test 3's DMM data still applied, so that Standby is in his list.
+- Stand next to him.
+
+F7, dump. Queued and run in H0:
+- Log TLS+0x1EC and the H0 call rate.
+- Log the server manager (compare its vtable with RTTI) and the self key: [[[[base+0x6D69190]]+0x30]+0x50]+0x60.
+- Log the server player and owner, the clan vtable check, and control and controlKey.
+- Log every clan+0x18 record: CharacterKey through 0x389570, mercNo, actorKey, and the distance through 0x4F8220.
+- Log every clan+0xB8 entry, and the same list from the client clan for comparison.
+
+F8, accompany the nearest comrade:
+1. Pick the nearest record within 20 m with actorKey != 0 and mercNo != -1 that is not already in clan+0xB8 and is not excluded. Excluded by default: owner, control actor, and the playable keys 1, 4 and 6.
+2. Otherwise use the ini key (default Morrow, 0xF4DD8). If he is not spawned, 0x2B98830 should summon him.
+3. Call 0x2150930 with {controlKey, comradeKey}.
+4. Log *err by name, outPairs, and clan+0xB8 afterwards. Then run F7 again a second later to check that the client list matches.
+
+How to read the outcome:
+- err = NoInvalidMercenaryData: wrong clan, or he is not an owned record. Compare with the F7 records.
+- err = NotFoundFocusActor: the +0xA0/+0xD8 chain is wrong.
+- err = 0 and he walks to you and follows, then fights the next enemy: the core works, and the next step is H1, H2 and the clones.
+- err = 0 and he appears or stays but stands still: his camp chart lacks the accompany branches. Next step: AI-side work (decode handler 0x21C, or try ini key Ryan 0x199 or Andrew 0x287).
+- err = 0, then press vanilla Standby on him:
+  - Standby shows: the 0x9FB sync and CheckAccompanyType work.
+  - He stops: vanilla chart events 0x21D and 0x2AC9270 already work, so the plugin may not need F9.
+- Then save, reload and run F7 to answer the persistence question.
+- A crash: the log's last step shows where.
+
+Follow-up experiment 2 (once experiment 1 works):
+- F9 toggles Standby/Follow through 0x21523A0 + 0x297EF40.
+- F10 disbands through 0x2BA10A0.
+- After each, compare the client and server lists.
+- Then add H1, H2 and the clones.
+
+Files are in scratchpad\gca\:
+- plan_aob.txt (the AOB list) and plan_aob.py
+- f27733F0.txt (the server loop)
+- f2150930.txt (AccompanyMercenary)
+- f2151570.txt (remove)
+- f2AC9270.txt (the AI SetAccompanyType path)
+- f2B98830.txt (the post-registration and summon step)

@@ -1,0 +1,758 @@
+SPEC: Greymane Companions, routine / dismiss / map (static research only; nothing was run in the game; no project files were edited)
+
+Files to change: Desktop\Greymane Companions\asi\src\game.cpp and hotkeys.cpp. main.cpp and tools\build_test4.py stay as they are. The scratch byte checker I used is <scratchpad>\gca\wf8\spec\chk.py. It reads the exe file only.
+
+I re-checked these against the exe for this spec:
+- All 7 condition slots hold the expected stub, and each type function is "B8 <id lo> <id hi> 00 00 C3".
+- RTTI names: 0x55B8448 ClientAiActorComponent, 0x5B28988 ServerAiActorComponent, 0x59881A0 UIMapTextureInfoManager, 0x55BEC90 ClientMinimapActorComponent, and all 7 condition vtables.
+- 0x22E39B0 compares byte [self+8] with the schedule entry's location type (0x22E3A28).
+- The 0x9E8D10 prologue (46 bytes) is unique, and the call at 0x9E8A6B leads to it.
+- The bytes at 0x22D5FE1 are 4D8BC6 498BD5 498BCF FF5008 (the evaluator's vt+8 call).
+- 0x2BA1265 is mov r9b,1, then the call to 0x2151570.
+- Minimap slot 0x55BEC90+0xF8 = 0x9E7C60. That update reads only rcx.
+
+Two corrections to the research came out of this:
+- MAP: in 0x9E8D10 the 5th argument means "explicitly no icon", not "decided". 0x9E90AA writes 1 there together with tex = 0xFFFF; 0x9E9FDB (the hide path) writes 1. The caller 0x9E89C0 skips its fallback when that flag is set (0x9E8BF1). The detour must never set it. The research's "*decided = 1" would hide the icon.
+- MAP: the two "deliberate no-icon" exits in the mercenary branch are static npcInfo flags, not cutscene hides. 0x9EA0B0 tests npcInfo(+0x6C)+0x1C bit 0 (0x9EA0FF). 0x9E9A29 tests bit 0x20. [0x6CF7144] is the error constant eErrNoInvalidNpcInfo, used only as a nonzero value. So overriding them for recruited comrades is what we want.
+
+======================================================================
+0. COMMON CHANGES
+======================================================================
+
+0.1 Optional verification. The existing PROLOGUES / CALLS tables are all-or-nothing: on a mismatch nothing is hooked. Leave them unchanged. Add a separate table for the new features, so a mismatch turns off only that feature:
+
+  struct Bytes { uintptr_t rva; const char* hex; const char* name; };
+  static const Bytes OPTIONAL_BYTES[] = {
+    { 0x22D5FE1, "4D8BC6 498BD5 498BCF FF5008", "condition evaluate call" },               // routine
+    { 0x9E8D10,  "48895C2420 4C89442418 4889542410 48894C2408 55 56 57 4154 4155 4156 4157 488DAC2460F8FFFF 4881ECA0080000", "map icon selector" },
+  };
+  static const Call OPTIONAL_CALLS[] = { { 0x9E8A6B, 0x9E8D10, "map icon selector call" } };
+
+Use Matches()/CallTarget() as they are. Each feature's installer checks its own rows and logs "<name> does not look as expected - <feature> is off".
+
+0.2 One helper for vtable-slot swaps, replacing the inline safe-spot code at game.cpp 2580-2598:
+
+  static bool SwapSlot(uintptr_t slotRva, uintptr_t expectRva, void* detour, void** original, const char* name)
+  {
+      void** slot = (void**)(g_base + slotRva); DWORD old;
+      if (*slot != (void*)(g_base + expectRva) || !VirtualProtect(slot, 8, PAGE_READWRITE, &old))
+      { Log("%s: slot not as expected - off", name); return false; }
+      void* seen;
+      do { seen = *slot; *original = seen; } while (InterlockedCompareExchangePointer(slot, detour, seen) != seen);
+      VirtualProtect(slot, 8, old, &old);
+      return true;
+  }
+
+The safe spot then becomes SwapSlot(SLOT_SAFE_SPOT, CLAN_TELEPORT, &SafeSpotDetour, (void**)&g_clanSafeSpot, "safe spot"). Every slot used here is in .xdata, the same place as SLOT_SAFE_SPOT. Nothing in .xtls is written.
+
+0.3 Ini switches. Read them in GameInit next to TeleportEffect. hotkeys.cpp WriteDefault only appends the block when TeleportEffect is missing. After that block, add every new key that is missing with WritePrivateProfileStringA("Experiments", key, default, path). A second [Experiments] section would be ignored. Probe each key with the "\x01" default as now. Also update the EXPERIMENTS_INI text for fresh installs.
+
+  HideRoutine = 1         routine hook, ON by default
+  DropRoutine = 0         changes meaning: Resync at recruit, see 1.6. Experiment. The user's ini already says 1, so he gets it.
+  StayBehind = 1          summoned-copy dismiss, see 2.2. ON by default.
+  MapIcon = 1             map icon detour, ON by default
+  MapIconStyle = 0        0 = Actor_Party_Default (mgr+0x104), 1 = Actor_Character (mgr+0x100; 0x9EACF2 adds a label to it, probably his name)
+  MapIconRefresh = 0      map fallback B, see 3.5. Experiment, unverified.
+
+New globals: g_hideRoutine, g_stayBehind, g_mapIcon, g_mapIconRefresh, g_mapIconOffset (0x104 or 0x100).
+
+GameInit log line:
+  "experiments: catch-up teleport %s, hide the routine %s, drop it at once %s, stay behind %s, map icon %s (%s), map refresh %s"
+
+0.4 Remove the StageStart experiment:
+- EVENT_STAGE_START 0xB4A6B14A, and the RaiseEvent at game.cpp 1615.
+- The `dropped` logic in DismissHeld (2021/2034).
+
+Keep EVENT_RESET_SCHEDULE 0x99DB94AD and Comrade.routineDropped (it gets a new meaning, see 1.6).
+
+0.5 There is no GC_RESEARCH switch in the source. The research log lines below are always written, as everything else in the plugin is. Log() is thread-safe (SRW lock in log.cpp), but it calls fflush on every line. So no detour that runs every frame may call Log. Detours only write small lock-free records, and the 250 ms pump (server thread) writes them to the log.
+
+======================================================================
+1. ROUTINE: a recruited camp comrade drops his NPC-schedule task
+======================================================================
+
+1.1 Mechanism (upheld by the skeptic). Seven AI-condition vtable slots get detours. For a comrade the plugin hides, they answer as if he had no schedule, except departure, which answers "leave now". Result codes: 0 = TRUE, 1 = FALSE.
+
+  typedef uint8_t (__fastcall* CondEvalFn)(uintptr_t self, uintptr_t runner, uintptr_t ctx);
+  // vt+8; called from the generic evaluator at 0x22D5FEA with rcx=cond, rdx=runner, r8=ctx
+
+  struct CondSlot { uintptr_t slot, original, typeFn; uint16_t typeId; uint8_t forced; const char* name; };
+  static const CondSlot COND_SLOTS[] = {
+    { 0x58C01A8, 0x22E38B0, 0x22E38A0, 0x217, 0, "CheckToDepartureNextNPCSchedule" },     // jmp .xtls 0xEBD4180
+    { 0x58C2208, 0x22E3200, 0x22E31F0, 0x20B, 1, "CheckExistNPCScheduleInfo" },           // jmp .xtls 0xEBCE770
+    { 0x58C0170, 0x22E39B0, 0x22E39A0, 0x21A, 1, "CheckCurrentNPCScheduleLocationType" }, // plain code
+    { 0x58C0288, 0x22E3A50, 0x22E3A40, 0x21B, 1, "CheckMainScheduleType" },               // jmp .xtls 0xEBD8860
+    { 0x58C0058, 0x22E3F10, 0x22E3F00, 0x225, 1, "CheckNextNPCScheduleLocationType" },    // jmp .xtls 0xEBE2A60
+    { 0x58BFED0, 0x22E4710, 0x22E4700, 0x22E, 1, "CheckNPCScheduleSpawnAction" },         // plain code
+    { 0x58BFCA0, 0x22E49B0, 0x22E49A0, 0x230, 1, "CheckNPCScheduleInitialAIControlType" },// jmp .xtls 0xEBF21D0
+  };
+
+Installer InstallRoutineHide(), called from GameInit after the safe-spot swap, only when g_hideRoutine:
+- Require OPTIONAL_BYTES "condition evaluate call".
+- For each row, check memcmp(g_base+typeFn, {0xB8, id&0xFF, id>>8, 0, 0, 0xC3}, 6) and R64(g_base+slot) == g_base+original. Do this for all rows before swapping any.
+- Rows 0-5 are all-or-nothing. With departure forced alone he loops back into his schedule (re-decision #0x334 / #0x246 prefer the schedule). Row 6 is optional: skip it alone on a mismatch.
+- Then SwapSlot for each row with COND_DETOURS[i].
+- Log "routine hide: %d condition slots swapped" or "routine hide: <name> not as expected - off".
+
+1.2 Detours (they run on whatever thread runs the chart). For client-run comrades that is the client AI update (0x8BE850 -> 0x91ADA0 -> 0x2070760, or the event handlers). For a server-run AI it is the server thread. Never inside the plugin's own calls.
+
+  static CondEvalFn g_condOrig[7];
+  static volatile LONG g_hidden[MAX_COMRADES], g_hiddenCount, g_condForced[7];
+
+  static __declspec(noinline) uintptr_t RunnerAi(uintptr_t runner)  // [[runner+0x68]], as CheckAccompany 0x22EA744..0x22EA74B
+  { __try { uintptr_t h = R64(runner + 0x68); return h ? R64(h) : 0; } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; } }
+
+  static __declspec(noinline) uint32_t AiKey(uintptr_t ai)  // [ai+8] = actor, actor+0x60 = key
+  { __try { uintptr_t a = ai ? R64(ai + 8) : 0; return a ? R32(a + 0x60) : 0; } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; } }
+
+  template<int I> static uint8_t __fastcall CondDetour(uintptr_t self, uintptr_t runner, uintptr_t ctx)
+  {
+      uint8_t r = g_condOrig[I](self, runner, ctx);  // the original first, as vanilla; its answer is also research data
+      if (!g_hiddenCount) return r;                  // fast path: one load when nobody is hidden
+      uintptr_t ai = RunnerAi(runner);
+      uint32_t key = AiKey(ai);
+      if (!key) return r;
+      int slot = -1;
+      for (int i = 0; i < MAX_COMRADES; ++i) if ((uint32_t)g_hidden[i] == key) slot = i;
+      if (slot < 0) return r;
+      uint8_t f = COND_SLOTS[I].forced;
+      if (r != f) { InterlockedIncrement(&g_condForced[I]); NoteCond(I, self, ai, r); }
+      return f;
+  }
+  static void* const COND_DETOURS[7] = { (void*)&CondDetour<0>, ..., (void*)&CondDetour<6> };
+
+The skeptic's crash concern: 0x20B/0x21A/0x21B/0x230 never read rdx themselves. The chain is the game's own (CheckAccompany, SpawnAction 0x22E4727, departure 0xEBD4186), but it may not be valid for every one of the 24 evaluator callers. So it is read only after the g_hiddenCount fast path and only under __try. Do not require an exact AI vtable: a subclass would silently turn the feature off. NoteCond records the vtable instead (1.5).
+
+The key read on the client actor matches the server actor's key. The plugin already relies on that: c->selfKey from the client root is looked up on the server, game.cpp 464/475.
+
+1.3 The shared set is written only by the server thread, inside Track() (game.cpp 995). Track already runs on every phase change and in Adopt/Release.
+- Add `bool hide;` to Comrade.
+- At the end of Track():
+
+  LONG n = 0;
+  for (int i = 0; i < MAX_COMRADES; ++i) {
+      const Comrade& m = g_comrades[i];
+      LONG k = (m.phase != PHASE_FREE && m.hide) ? (LONG)m.actor : 0;
+      if (g_hidden[i] != k) { Log(k ? "%s: routine hidden from her AI (actor %08X)" : "%s: routine shown to her AI again (actor %08X)", k ? Name(&m) : "slot", k ? k : g_hidden[i]); InterlockedExchange(&g_hidden[i], k); }
+      n += k != 0;
+  }
+  InterlockedExchange(&g_hiddenCount, n);
+
+Release() does memset before its final Track(), so the "shown again" line cannot name her. Log it in Release() before the memset: "%s: routine shown to her AI again".
+
+Readers tolerate a stale view for one tick: either answer is harmless for one evaluation.
+
+Where hide is set:
+- RecruitHeld, just before the Track() at 2043:
+  m->hide = g_hideRoutine && SpawnType(c, actor) == 0xC;
+  Log "recruit: %s - her routine is hidden from her AI (camp actor)" when set.
+  Hiding before the Follow event lets her next chart tick see "no schedule" already. This replaces the PHASE_ASKED trigger the research proposed.
+- Adopt (1238), before Track(): m->hide = g_hideRoutine && SpawnType(c, actor) == 0xC. A summoned copy (0xE) is never hidden; it has no schedule.
+- PHASE_STANDBY, PHASE_LOST and PHASE_REFOLLOW keep hide. In Standby she must not wander back to her routine.
+- Cleared automatically by Release() -> SetPhase(PHASE_FREE) -> Track(). In DismissHeld, Release() already runs before Resync (2024 vs 2032), so the schedule is visible again when her chart restarts. Every other Release path (gave up 1446, remembered too long 1418, not registered 1911/1921, taken off the list 1577) goes through Track() too.
+
+1.4 What the 0x21A answer costs (skeptic). Forcing CheckCurrentNPCScheduleLocationType to 1 is needed for two things:
+- #0x2FE "CurLocType#8 -> CommonMoveFind {_moveType=RandomMoveActionSchedule}" would otherwise send a random-walk comrade back to SetScheduleMovePath (#0x246 stmt 1483, which no forced condition covers).
+- The OnParty_FormationMoveStart guard #0x102D.
+
+But forcing it also closes the action-point exit (ActionPointAction OnUpdate 0x4B stmt 190 IF OR(CurLocType#1..#3) -> 191/193 departure).
+
+The "#n" in the decoder output is the condition instance, not the location-type value. The mapping from instance to the type byte [self+8] (read at 0x22E3A28) was not decoded (UNVERIFIED). So the shipped rule is: force 0x21A for every type. The action-point (bench) case is then handled by the stuck fallback in 1.6. NoteCond logs [self+8] for every 0x21A instance it overrides. After one bench test, a keep-list (pass through for the bench's type bytes) can be added if wanted.
+
+1.5 Research records (lock-free; written by the detour, logged by the pump):
+
+  struct CondSeen { volatile LONG64 self; uint8_t idx, param, orig, clientEnabled; uint32_t aiVt; volatile LONG ready; };
+  static CondSeen g_condSeen[32]; static bool g_condLogged[32];  // g_condLogged: server thread only
+
+NoteCond(I, self, ai, r):
+- If self is already in the table, return.
+- Otherwise claim a free entry with InterlockedCompareExchange64(&e.self, self, 0) == 0.
+- Fill it under __try:
+  idx = I;
+  param = (I == 2 ? R8(self+8) : 0);
+  orig = r;
+  aiVt = (uint32_t)(R64(ai) - g_base);
+  clientEnabled = R8(R64(ai + 0x90) + 0x66), with an S null check. S = CommonAiActorComponent+0x90 per 0x2083470; 2 = schedule enabled. This shows whether the StageStart tests left her schedule disabled on the client.
+- Then InterlockedExchange(&e.ready, 1).
+
+In PumpHeld, after WatchList:
+- Write each ready entry not yet logged:
+  "routine: %s (condition %p, location type %u) answered %u, now %u; her AI %s (vt %X), client schedule enabled %u"
+  The AI is named "client" if aiVt == 0x55B8448, "server" if 0x5B28988, otherwise "other".
+- In the status block (every STATUS_MS) when g_hiddenCount:
+  "routine hidden for %ld: departure %ld, exist %ld, location %ld, main %ld, next location %ld, spawn action %ld, initial control %ld forced"
+  These are deltas of g_condForced.
+
+Also at Recruit and at Dismiss, log the server copy of the schedule state, on the server thread under __try. Use the skeptic's correction: the slots are reached through pointers. ai = R64(R64(actor+0x68)+0x58), checked against VT_SERVER_AI; S = R64(ai+0x90).
+  "  schedule (server copy): enabled %u, current slot %u, next slot %u"
+  enabled = R8(S+0x66); current = R16(R64(S+0x10)); next = R16(R64(S+0x18)).
+UNVERIFIED: that ServerAiActorComponent+0x90 is the same structure. The label says "server copy".
+
+1.6 Dropping the task at once, and the stuck fallback. What the hook alone gives (upheld): NPCScheduleAction OnUpdate #0x2EC departure -> NPCScheduleActionWait (0x263). That waits for the running action's OnActionEnd_Upper, or for the OnWatchdog_ActionEndTimeOut -> #0x4 watchdog. Then NPCScheduleEndActionPackage (RefreshNextSchedule, IngEnd animation), CheckPoint#0, and the WaitPackage re-decision with no schedule, i.e. the party branches. How long that wait is was not shown: it depends on the action, and the watchdog value is unknown.
+
+Two additions, both in Look():
+
+(a) DropRoutine (experiment, ini). Replace game.cpp 1610-1617 with:
+
+  if (g_dropRoutine && m->hide && !m->routineDropped)
+  { m->routineDropped = true; Resync(c, m->actor, "drop the routine (schedule hidden)"); SetPhase(m, PHASE_REFOLLOW, now); }
+  else SetPhase(m, PHASE_FOLLOWING, now);
+
+- Resync (0x2BCCC00) is the game's own move-rejection answer: client 0x9FF390 -> chart restart 0x206EED0.
+- It was seen to drop the task before. It failed only because the re-decision (#0x334) picked the schedule again, and with the hook that branch is closed.
+- The existing PHASE_REFOLLOW resends Follow 1 s later, which covers "Resync can swallow the first Follow" (comment at 1951). routineDropped prevents a loop.
+- Expected: he snaps to the server position (the server mirrors client moves, so the snap is small), stands up and follows.
+- UNVERIFIED: whether the chart restart resets the share value _moveType. If the log shows him walking back to his spot after the Resync, raise EVENT_RESET_SCHEDULE 500 ms after the Resync with RaiseLater. Its #0x1F4 sets _moveType = _nextAIMoveType = None, then CheckPoint#0, and is harmless while hidden.
+
+(b) Stuck fallback (ON with HideRoutine). This covers action points, mise-en-scene, and anything the conditions do not release.
+- Add `ULONGLONG hideSince; float sx, sy, sz; bool moved;` to Comrade.
+- When a hidden comrade enters PHASE_FOLLOWING, set hideSince = now and copy m->x/y/z into sx/sy/sz. LogStatus keeps m->x/y/z current.
+- In PHASE_FOLLOWING:
+  - If !moved and the distance from (sx, sy, sz) is > 1.5 m: moved = true; Log "%s: left her routine after %.1f s", (now - hideSince)/1000.0. This is the timing data the skeptic asked for.
+  - Else if !moved && !routineDropped && now - hideSince >= 15000 && DistanceTo(c, actor) > 8: routineDropped = true; Log "%s: still on her routine after 15 s (%.1f m from you) - restarting her AI"; Resync(c, m->actor, "still on her routine"); SetPhase(m, PHASE_REFOLLOW, now).
+- With the schedule hidden, the restarted chart (OnAi #0x11B4 -> WaitPackage) cannot re-enter ReadyToNPCSchedule / action-point packages: they hang off CheckExist / NextLocationType, both forced 1.
+
+1.7 Dismiss of a camp comrade (routine side). Raise OnResetNPCSchedule for every spawn-0xC dismiss, not only after StageStart:
+
+  RaiseLater(ch.target, EVENT_RESET_SCHEDULE, "Reset schedule (her routine again)", now + 1000);
+
+#0x1F4 sets _nextAIMoveType = None and _moveType = None, runs vanilla RefreshNextSchedule, then CheckPoint#0. From there CheckExist (now real) -> CommonMoveFind #0x246 entry 1492 -> SetScheduleMovePath -> he walks to his current slot -> ReadyToNPCScheduleActionPackage.
+Caveat (earlier research): the event has allow 0 and is refused while he is mounted, in a vehicle or in a sequencer. The RaiseEvent result line shows it.
+
+1.8 Unverified, with fallbacks:
+- Whether a recruited camp comrade is an AI party member (IsInParty / CheckActor#1 for LeaderWaitPackage). This is inferred from vanilla comrades following after their stay ends and from schedule-less summoned copies following at once. Fallback: the existing CatchUp at 96 m, plus the REFOLLOW Follow.
+- A disabled schedule from the StageStart tests (client S+0x66 != 2) makes departure permanently FALSE. Forcing overrides that while hidden, but after Dismiss he would not resume. Tell the user to reload a save from before the StageStart tests, and to back up his saves first. The 1.5 log shows clientEnabled.
+- _isPositiveInteraction is set in OnAi only when CheckExist is true or he is roaming; it will not be set after a restart while hidden. Its only readers are sequencer/patrol events. Low risk, not ruled out.
+
+======================================================================
+2. DISMISS: a dismissed comrade does not vanish in front of you
+======================================================================
+
+2.1 Camp comrade (cc+0x2D0 == 0xC): keep today's sequence in DismissHeld (upheld):
+- Health check.
+- t_skipSafeSpot = actor; g_removeAccompany(clan, &err, {index}, 0,0,0,0) /*0x2151570*/; t_skipSafeSpot = 0.
+- Release(keepLeash = true): Depart keeps cc+0x468 = 1e6.
+- Resync.
+- New: OnResetNPCSchedule at +1 s on every camp dismiss (1.7).
+Never use DisbandByKeys on a 0xC actor: 0x2B99050 would unsummon him (0x2B8FB10) or log him out (0x2B9912A).
+
+Fixes in WatchDeparted / Depart. The skeptic upheld that the sweep 0x2C37340 measures camp actors from the player (spawner A0100001, 0x2C37C42 -> 0x2C37D56 -> logout 0x2C38F14). So:
+- Add `static const float DEPART_RESTORE_NEAR_M = 50.0f;`.
+- WatchDeparted 1197: restore the old logout distance when dist > 100, or when a fast travel is seen (2.3). At DEPART_MAX_MS restore only if 0 <= dist < 50; log "dismissed %s: watched long enough, %.0f m from you - logout distance back to %.0f m". Otherwise keep the slot with no time limit, logging every 30 s after the first minute: "dismissed %s: still %.0f m from you - leash kept".
+  Reason: restoring 64 m while he is 64-100 m away logs him out at once, possibly in view.
+- Depart, when all slots are full (1110-1120): evict first a slot whose actor is gone, then one under 50 m, then the oldest. Log "dismissed %s: evicted from the watch at %.0f m%s", with " - may vanish in view" when the evicted one is between 64 and 100 m.
+
+Log additions (log only):
+- Store `float homeX, homeY, homeZ; bool haveHome;` in Comrade at RecruitHeld (WorldPos of her actor) and pass them to Depart.
+- WatchDeparted's line gets ", %.1f m from her recruit spot".
+- Optional respawn watch: after "actor %08X gone" for a camp slot, keep {key, since, home} in a 4-entry g_respawn array. Every 2 s for 10 min, check RecordOf(key)->actor. When it is a new nonzero key:
+  "dismissed %s: respawned as %08X, spawn type %d, %.1f m from her recruit spot, %.1f m from you"
+  This confirms the inferred "the schedule spawns him again at home". Not shown yet.
+
+2.2 Summoned copy (cc+0x2D0 == 0xE): "stays behind, unsummoned out of sight" (StayBehind = 1, default ON). Only steps already seen working in game are used:
+- Standby event + type 1: notes.md experiment 2, a copy stood still 3315 m away with no catch-up.
+- DisbandByKeys: the vanilla quick-slot path, 0x9C7 handler 0x2A33000 -> 0x2BA10A0 (upheld).
+Walking him 2 km back to his camp is not something the game offers (the "no walk-away path" claim was not upheld as universal, but nothing better was found).
+
+Departed gets:
+  uint16_t index; bool summoned; ULONGLONG nextTry; float homeX, homeY, homeZ; bool haveHome;
+
+Signatures:
+  Depart(c, key, actor, oldLeash, now, index, summoned, home)
+  Release(c, m, why, now, keepLeash = false, summoned = false)
+Release passes m->index and summoned to Depart. A summoned slot stores oldLeash = 0: there is nothing to restore after the unsummon.
+
+DismissHeld, right after the `if (!EntryOf(index))` check (1978):
+
+  if (DepartingSummoned(key)) { Log("dismiss: %s is already leaving - he goes when you are out of sight", name); return; }
+
+In the spawn == SPAWN_SUMMONED branch (1998), when g_stayBehind:
+
+  bool set = SetType(c, index, TYPE_WAIT);                       // 0x21523A0 + ack 0x297EF40 (packet 0x940)
+  bool ok = RaiseEvent(c, ch.target, EVENT_WAIT, "Standby (stays behind)");  // #0x21D needs him still on the list
+  Log("dismiss: %s stays behind (type Standby%s, event %s); unsummoned when you are %.0f m away or travel",
+      name, set ? "" : " FAILED", ok ? "taken" : "refused", DEPART_OUT_OF_SIGHT_M);
+  Comrade* m = Find(key);
+  if (m) Release(c, m, "dismissed - stays behind", now, true, true);
+  else Depart(c, key, ch.target, 0, now, index, true, NULL);
+  return;  // he is still on the list on purpose: skip the "still on the list" check
+
+With StayBehind = 0, keep the old Disband(c, key).
+
+WatchDeparted, summoned slot, each pump:
+
+  ReadClan(c); const Entry* e = EntryOf(d.index);
+  if (!e)                       -> Log("dismissed %s: the game took him off the list"); done
+  else if (Following(e->type))  -> vanilla Follow was pressed:
+        Comrade* m = Add(d.key, d.index);
+        if (m) { m->actor = e->actor; m->leashed = e->actor; m->oldLeash = 0; Log("dismissed %s: Follow pressed - looked after again"); SetPhase(m, PHASE_FOLLOWING, now); }
+        else Log("dismissed %s: Follow pressed - %d companions already, left to the game", MAX_COMRADES);
+        done (no leash restore)
+  else if (e->actor && e->actor != d.actor) -> d.actor = e->actor; TrackDeparted();  // the game re-summoned him (load)
+  if (!found && e) or dist > 100 or travelled (2.3), and now >= d.nextTry:
+        ReadHealth(him) and ReadHealth(your control actor): if he is down or dead, or you are dead, wait.
+        0x2B8E440 refuses while the player is fatal or dead (eErrNoPlayerIsFatalOrDead 0x6CF7D58, 0x2B8E4D1).
+        t_skipSafeSpot = d.actor; Disband(c, d.key); t_skipSafeSpot = 0;  // skips vt+0x180 0x2B98E20 (SafeSpotDetour compares actor+0x60)
+        if (EntryOf(d.index)) { d.nextTry = now + 2000; Log("dismissed %s: still on the list - trying again"); } else done;
+
+There is no 10-minute timeout for summoned slots: it would unsummon him in front of you (skeptic).
+
+Known costs, accepted:
+- Until he is unsummoned he stays on the accompany list in Standby. He keeps his quick-slot / Party HUD entry.
+- The Dismiss option (DMM Not CheckAccompanyType None) and vanilla Follow both show on him. A second Dismiss is ignored, with a log line.
+- A save made in that window reloads him as a vanilla Standby companion the plugin does not know. A fresh Dismiss then starts the stay-behind again.
+
+2.3 Fast-travel detection for WatchDeparted (server thread):
+  static float g_lastPx, g_lastPy, g_lastPz; static bool g_haveLastP; static ULONGLONG g_lastWatch;
+  travelled = (g_haveLastP && c->havePos && Dist(you, last) > 100) || now - g_lastWatch > GAP_MS;
+Update both at the end of WatchDeparted. After a travel a summoned slot is disbanded at once, unseen across the load. A camp slot gets its logout distance back.
+
+2.4 Not in this build (the skeptic rates it riskiest):
+- RemoveAccompany for a copy without Disband, then 0x2B8FB10(clan, u32* err, u64 mercNo = record+0x28) later.
+- typedef uint32_t* (__fastcall*)(uintptr_t clan, uint32_t* err, uint64_t mercNo).
+- If he is logged out by something else first (field change, as at 18:58:33), 0x2152570 refuses with 0x6CF7A90 (record+0x50 == 0, 0x2152636), and the record may stay summoned (+0xC4) in the save. err = 0 does not prove a post (0x2B8FB72).
+- Only revisit if the quick-slot entry during the stay-behind turns out to bother the user.
+
+2.5 Optional log probe (research, off unless needed). Swap clan vt+0x188 at 0x5B2C850 (expected 0x2B99050; prologue 48895C2408 48896C2410 4889742420 57 4883EC70 488BDA, unique) with a pass-through.
+  typedef void (__fastcall*)(uintptr_t clan, uintptr_t actor);
+  It logs R32(merc+0x18) against R32(R64(clan+8)+0x60), and whether the unsummon (0x2B8FB10 at 0x2B99109) or the immediate logout (0x2B9912A) runs. null-check merc = R64(R64(actor+0x68)+0x118) first: 0x2B99050 reads it unchecked at 0x2B990B1. Server thread; logging is fine there.
+
+======================================================================
+3. MAP: recruited Greymanes get a world-map / minimap icon
+======================================================================
+
+3.1 Why they have none (upheld):
+- Damiane and Oongka have _playerIndex 2/3 (+0x104). Branch 0x9E9191..0x9E9276 shows their own +0x1E6 texture (0x13F7 / 0x13F8) when they are owned mercenaries.
+- Camp comrades (_playerIndex 0, actor kind 4 per the jump table 0x9EA07C) go to 0x9E99B1. There the icon depends only on the mercenary state 0x214D130: 3 -> Faction_OperationCharacterActor (0x9E9AE7), 1 -> Actor_Character (0x9E9B05), anything else -> no icon with tex left 0xFFFF and the hide flag NOT set (0x9E9AFA -> 0x9EA027).
+- characterinfo _uiMapTextureInfo is not read on that branch, so no DMM edit can help.
+
+3.2 Hook. MinHook on the client function 0x9E8D10 (plain code, unique prologue, OPTIONAL_BYTES row + OPTIONAL_CALLS row). Its callers: 0x9E89C0 from the minimap update 0x9E7C60, the cached task 0x94FB30 and the .xtls caller 0x9C61E0B. The hook covers all of them.
+
+  static const uintptr_t MAP_ICON_SELECT = 0x9E8D10;
+  static const uintptr_t VT_MAP_TEXTURES = 0x59881A0;   // .?AVUIMapTextureInfoManager@pa@@
+  static const uintptr_t MAP_TEX_CHARACTER = 0x100, MAP_TEX_PARTY = 0x104;   // Actor_Character / Actor_Party_Default
+  typedef uint64_t (__fastcall* MapIconFn)(uintptr_t comp, uintptr_t focus, uintptr_t owner, uint16_t* tex,
+                                           uint8_t* noIcon, uint8_t* groggy, uint8_t* removed, uint8_t* relation);
+  // the args are [rbp+0x7E0..0x818], with rbp = entry rsp - 0x7D8
+
+  static uint64_t __fastcall MapIconDetour(uintptr_t comp, uintptr_t focus, uintptr_t owner, uint16_t* tex,
+                                           uint8_t* noIcon, uint8_t* groggy, uint8_t* removed, uint8_t* relation)
+  {
+      uint64_t r = g_mapIconSelect(comp, focus, owner, tex, noIcon, groggy, removed, relation);
+      __try {
+          if (!tex || *tex != 0xFFFF || (noIcon && *noIcon) || (removed && *removed)) return r;  // the game chose, hid or removed it
+          uintptr_t actor = R64(comp + 8);                                   // 0x9E8D8D
+          int slot = TrackedSlot(actor ? R32(actor + 0x60) : 0);
+          if (slot < 0 || slot >= MAX_COMRADES) return r;                    // recruited comrades only, not the departed (4..7)
+          InterlockedIncrement(&g_mapCalls[slot]);
+          if (R8(R64(R64(actor + 0x68) + 0x20) + 0x273)) return r;          // dead: no party icon on a body (0x9E9575 path)
+          uintptr_t tls = *(uintptr_t*)__readgsqword(0x58);                 // the same chain as 0x9E8A70..0x9E8A9B
+          uintptr_t m = R64(g_base + (tls && R8(tls + 0x1EC) ? LOCAL_STRINGS_SERVER : LOCAL_STRINGS_CLIENT));
+          m = m ? R64(m) : 0; m = m ? R64(m + 8) : 0; m = m ? R64(m + 0x270) : 0;
+          if (!m || R64(m) != g_base + VT_MAP_TEXTURES) return r;
+          uint16_t t = R16(m + g_mapIconOffset);
+          if (t == 0xFFFF) return r;
+          NoteMap(slot, R32(actor + 0x60), R8(R64(actor + 0x88) + 1), R8(comp + 0x34), t);
+          *tex = t;  // never set *noIcon: 1 there means "no icon" (0x9E90AA, 0x9E9FDB)
+      } __except (EXCEPTION_EXECUTE_HANDLER) {}
+      return r;
+  }
+
+Install in GameInit when g_mapIcon, after HookProbes:
+  MH_CreateHook(g_base+MAP_ICON_SELECT, &MapIconDetour, &g_mapIconSelect) + MH_EnableHook
+Log "map icon: hooked (%s)" with "party icon" or "character icon", or "map icon: could not hook (%d)".
+
+Threads: it may run on the client main thread, the cached-task worker, or the .xtls caller's thread. It reads only volatile g_tracked (written by the server thread in Track) and game memory under __try. It takes no locks and never calls Log.
+
+Lifetime: the icon shows in every phase except FREE: following, Standby, lost, re-follow. It disappears when Release -> SetPhase(PHASE_FREE) -> Track() clears g_tracked[slot]. That covers Dismiss and the stay-behind copy, which sits in departed slots 4..7, ignored here. To hide it in Standby too, add a separate g_mapKeys[] filled in Track() for the following phases only. The default keeps it in Standby: a waiting companion is the one you most need to find on the map.
+
+Nothing reaches the save: the detour writes only the caller's stack local (tex).
+
+3.3 Research records:
+  struct MapSeen { volatile LONG key; uint8_t kind, bits34; uint16_t tex; volatile LONG ready; };
+  static MapSeen g_mapSeen[MAX_COMRADES]; static volatile LONG g_mapCalls[MAX_COMRADES];
+NoteMap fills a slot the first time it sees a key (InterlockedCompareExchange on key). The pump logs:
+  "map: %s gets icon %04X (actor %08X, kind %u, comp+0x34 %02X)"
+and in the status block:
+  "map: selector calls for the comrades %ld/%ld/%ld/%ld"
+Clear a MapSeen entry when its g_tracked slot changes, in Track().
+
+3.4 UNVERIFIED, the main risk: that 0x9E8D10 ever runs for an actor that never had an icon. 0x9E7C60 calls the selector only when (comp+0x34 & 6) (0x9E7DFD) and [0x6CC1A98] == 0. The bits are written by the applier 0x9EA6F0 itself (0x9EAC01, 0x9EAF77). Otherwise only the cached task's key list ([task+0x90], count +0xA0) or the .xtls caller run it, and nobody knows who is on those lists. The first test answers it:
+- "map: %s gets icon" appears and the icon shows: done.
+- The selector-call counter stays 0 for a comrade: use fallback B.
+- The counter climbs but no icon appears: the applier filters further (0x9EA6F0, not decoded); report back.
+
+3.5 Fallback B (MapIconRefresh, experiment, default 0, UNVERIFIED meaning of the bits). Swap the minimap update slot SwapSlot(0x55BEC90 + 0xF8, 0x9E7C60, &MinimapUpdateDetour, &g_minimapUpdate):
+
+  typedef void (__fastcall* MinimapUpdateFn)(uintptr_t comp);  // 0x9E7C60 reads only rcx (checked)
+  static void __fastcall MinimapUpdateDetour(uintptr_t comp) {
+      __try { uintptr_t a = R64(comp + 8); int s = TrackedSlot(a ? R32(a + 0x60) : 0);
+              if (s >= 0 && s < MAX_COMRADES && !(R8(comp + 0x34) & 6)) *(volatile uint8_t*)(comp + 0x34) |= 2; }
+      __except (EXCEPTION_EXECUTE_HANDLER) {}
+      g_minimapUpdate(comp);
+  }
+
+This writes one client UI byte on the thread that owns the component, so the selector runs for him. The meaning of bit 1 is not decoded; try bit 2 (|= 4) if bit 1 does nothing.
+
+3.6 Not recommended, and why:
+- A _uiMapTextureInfo data edit is ignored on the kind-4 branch.
+- Changing _playerIndex makes him a switchable playable character (side effects unknown).
+- Marking comrades Follow-into-Combat (packet 0xB83 / 0x2B93060, record +0xE2) changes gameplay through clan+0xA8.
+
+======================================================================
+4. DMM JSON (tools\build_test4.py)
+======================================================================
+No changes are needed for any track:
+- Routine: runtime only.
+- Dismiss: the existing Dismiss (0xF5011) and vanilla Follow / Standby on the 38 camp comrades already give the stay-behind flow its controls. Vanilla Follow shows on a staying-behind copy (type Wait) and re-adopts him (2.2).
+- Map: a characterinfo edit cannot work (3.1).
+The installed Test 4 JSON stays as it is.
+
+======================================================================
+5. DEFAULTS, TEST AND EXPECTED LOG
+======================================================================
+ON by default:
+- HideRoutine (vtable swaps, upheld mechanism)
+- The stuck fallback Resync
+- OnResetNPCSchedule on every camp dismiss
+- The DEPART 50 m restore rule and eviction fix
+- StayBehind (summoned copies)
+- MapIcon with the party icon
+- All log lines
+
+[Experiments], default 0:
+- DropRoutine (immediate Resync at recruit). The user's ini already has 1.
+- MapIconRefresh (fallback B)
+- MapIconStyle = 1 (Actor_Character with a label)
+- The 2.5 probe, compile-time
+
+Before testing: back up the saves and load one from before the StageStart tests.
+
+Test 1, recruit a sitting or working camp comrade (DropRoutine 0, then 1):
+- Expect "routine hidden from her AI".
+- Then "routine: ... answered 1, now 0" for departure.
+- Then "left her routine after N s", or after 15 s "still on her routine ... restarting her AI".
+- Then following. With DropRoutine 1: the resync line and following within about 2 s.
+- Repeat with a random-walk comrade and a bench (action-point) comrade. For the bench, note the "location type %u" values in the routine lines.
+
+Test 2, dismiss a camp comrade:
+- Expect "routine shown to her AI again", the resync, "Reset schedule ... taken / sent to her client", WatchDeparted lines with moved > 0 and the distance to her recruit spot shrinking.
+- "logout distance back to 64" only beyond 100 m (or under 50 m after 10 min).
+- Later, possibly "respawned as ...".
+
+Test 3, fast-travel with a comrade (summoned copy) and Dismiss him:
+- Expect "stays behind (type Standby, event taken)" and him standing still.
+- Walk more than 100 m away (or travel), then "DisbandByKeys -> 00000000 (ok)" with no safe-spot move, then "actor gone".
+- Pressing vanilla Follow on him before that gives "Follow pressed - looked after again".
+
+Test 4, map:
+- With a recruit following, expect "map: <name> gets icon XXXX" and an icon on the minimap and world map.
+- If "selector calls" stays 0, set MapIconRefresh = 1 and retry.
+
+======================================================================
+RESEARCH AND SKEPTIC VERDICTS
+======================================================================
+===== research:routine
+SUMMARY: TRACK sched: what it takes to make a recruited camp comrade drop his NPC-schedule task at once. This was static work only. Nothing in the game was run, and no project files were edited. Scratch scripts are in <scratchpad>\gca\wf8\sched\ (myvtof.py finds a vtable from an RTTI name, vtd.py, callers.py, nest.py prints a nested chart container, morrow_states.py, pk_of.py, where2.py).
+
+RESULT. The CheckToDepartureNextNPCSchedule check is not a timer. On every chart update it recomputes, from the game clock, which schedule slot should be active (0x20863A0 -> 0x1815E40). It reports true when that slot differs from the current slot. Its body is protected (.xtls 0xEBD4180). It is reached only through a 5-byte jmp stub at 0x22E38B0, and the only reference to that stub is its vtable slot at 0x58C01A8. CheckExistNPCScheduleInfo is the same: body .xtls 0xEBCE770, stub 0x22E3200, slot 0x58C2208.
+
+Condition results use 0 = TRUE, 1 = FALSE, 2 = undecided.
+
+Making departure true is not enough on its own. After the end animation the re-decision (WaitPackage InitLogic #0x334, CommonMoveFindPackage InitLogic #0x246, NPCScheduleEndAction #0x2FE, MoveEndLogic #0x2B2) still prefers the schedule: walk back to the spot, re-enter ReadyToNPCScheduleActionPackage, and loop. None of these handlers tests the accompany type. Following comes only from the party / formation branches, which sit after the schedule branches.
+
+So all schedule conditions must answer 'no schedule' for a recruited camp comrade, except departure, which must answer 'go now'. That makes his chart behave like a summoned (spawn 0xE) copy, which already follows at once.
+
+HOOK SPEC (recommended). Swap vtable slots, the same mechanism the plugin already uses for SLOT_SAFE_SPOT. No code bytes are patched. For each class: VirtualProtect the slot, then InterlockedCompareExchangePointer(slot, detour, expected).
+
+typedef uint8_t (__fastcall* CondEvalFn)(uintptr_t self, uintptr_t runner, uintptr_t ctx);  // vt+8. Called from 0x22D5EC0 at 0x22D5FEA with rcx=cond, rdx=runner, r8=ctx
+
+Slot table: slot RVA / expected value / vt+0x10 type-function bytes / forced result:
+- 0x58C01A8 / 0x22E38B0 (bytes E9 CB 08 8F 0C = jmp .xtls 0xEBD4180) / 0x22E38A0 'B8 17 02 00 00 C3' / 0 = depart now (CheckToDepartureNextNPCSchedule)
+- 0x58C2208 / 0x22E3200 (E9 6B B5 8E 0C -> 0xEBCE770) / 0x22E31F0 'B8 0B 02 00 00 C3' / 1 (CheckExistNPCScheduleInfo)
+- 0x58C0170 / 0x22E39B0 (plain code: 41 83 B8 D0 02 00 00 00 4C 8B D1 74 77) / 0x22E39A0 'B8 1A 02 00 00 C3' / 1 (CheckCurrentNPCScheduleLocationType)
+- 0x58C0288 / 0x22E3A50 (E9 0B 4E 8F 0C -> 0xEBD8860) / 0x22E3A40 'B8 1B 02 00 00 C3' / 1 (CheckMainScheduleType)
+- 0x58C0058 / 0x22E3F10 (E9 4B EB 8F 0C -> 0xEBE2A60) / 0x22E3F00 'B8 25 02 00 00 C3' / 1 (CheckNextNPCScheduleLocationType)
+- 0x58BFED0 / 0x22E4710 (plain code: 48 89 5C 24 08 48 89 6C 24 18 48 89 74 24 20 57 48 83 EC 20 48 8B E9 48 8B 7A 68) / 0x22E4700 'B8 2E 02 00 00 C3' / 1 (CheckNPCScheduleSpawnAction)
+- optional: 0x58BFCA0 / 0x22E49B0 (E9 1B D8 90 0C -> 0xEBF21D0) / 0x22E49A0 'B8 30 02 00 00 C3' / 1 (CheckNPCScheduleInitialAIControlType)
+
+Each slot value is referenced only by its own vtable, so a swap catches every call. All of these conditions return 1 for an actor with no schedule; I read this for 0xEBCE770, 0x22E39B0, 0xEBD8860, 0xEBE2A60, 0x22E4710 and 0xEBF21D0. Departure on its own also returns 1 when there is no schedule, which is why it gets the opposite forced value.
+
+Detour, one per slot (template<int I>). It returns the forced value if ScheduleHidden(runner), otherwise orig[I](self, runner, ctx).
+
+ScheduleHidden(runner) — a cheap key lookup, safe to call for every NPC on every frame:
+- First a fast path: return false if g_hiddenCount == 0.
+- holder = *(u64*)(runner+0x68); ai = *(u64*)holder (a ClientAiActorComponent, vtable 0x55B8448, or a ServerAiActorComponent for a server-run AI); actor = *(u64*)(ai+8); key = *(u32*)(actor+0x60).
+- This is the same chain the game's own CheckAccompany uses (0x22EA744..0x22EA74B), and the same one 0xEBD4186/0x20863A0 use. Then compare key (key != 0) against at most 4 keys.
+- If a key that survives respawn is wanted instead: the u16 character index is at *(u16*)(*(u64*)(*(u64*)(actor+0x68)+0x20)+0x30), the same read as 0x17EC206..0x17EC20E.
+
+Thread: the detours run on whatever thread runs the chart. For client-run comrades that is the client AI update (0x8BE850 -> 0x91ADA0 -> 0x2070760 or the event handlers). For server-run comrades it is the server thread. Never the plugin's dispatch hook.
+
+Shared set: static volatile LONG g_hiddenKeys[MAX_COMRADES] (4) plus volatile LONG g_hiddenCount. The server thread writes it with InterlockedExchange: store the key and then increment when adding; clear the key and then decrement when removing. The detour only reads it.
+- Add: in Look(), at the PHASE_ASKED -> Following(type) transition, when SpawnType == 0xC. This replaces the DropRoutine/StageStart block at game.cpp ~1609-1616. Keep it during Standby too.
+- Remove: at the start of DismissHeld's camp-actor path, before g_removeAccompany / Resync / OnResetNPCSchedule. Also in Release(), when m->actor changes after a fast travel (the summoned 0xE copy is not added), and on clean-up.
+
+Alternative: one MinHook on the plain generic evaluator 0x22D5EC0. Prologue: 48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57 41 54 41 55 41 56 41 57 48 83 EC 50 8B AC 24 A0 00 00 00 49 8D B8 88 03 00 00. Typedef: uint8_t(__fastcall*)(cond, runner, ctx, uint16 type in r9w, uint32 index at [rsp+0x28]). Use a 1024-byte table of forced values indexed by type. It runs for every condition of every AI, so the vtable swap is cheaper.
+
+WHAT HAPPENS ONCE HE IS FORCED (from the chart decode):
+1. NPCScheduleAction / RandomMove / GroupAction OnUpdate (#0x2EC / #0x2EE) -> NPCScheduleActionWait (state 0x263). On the way out, OnStateLeave #0x2E9 runs ClearNPCScheduleSpawnAction.
+2. NPCScheduleActionWait has no action of its own. It waits for OnActionEnd_Upper of the action that is still playing, i.e. that action's end. It is bounded by OnWatchdog_ActionEndTimeOut -> #0x4 CheckPoint.
+3. NPCScheduleEndActionPackage: on enter, And#710 -> RefreshNextSchedule. This is the vanilla function: it stores the slot the clock gives and is harmless. It plays AIActionChart_NPCScheduleIngEndAction#1. Then #0x2FE: with MainScheduleType and LocationType forced false it goes to CheckPoint#0.
+4. Re-decision: WaitPackage InitLogic skips the schedule block and goes to FindTarget, SummonerWait, LeaderWaitPackage (IsInParty && CheckActor#1) or Wait. Party formation moves then work, the way they do for summoned copies.
+5. An action-point user (ActionPointAction OnUpdate #0x4B, condition statement C48) goes to ActionPointEndAction.
+
+UNDO. The hook writes no game data. Once his key is removed, the real answers come back. The existing Dismiss then does Resync plus OnResetNPCSchedule (#0x1F4: _nextAIMoveType = _moveType = None, RefreshNextSchedule, CheckPoint#0). From there: CheckExist is true -> CommonMoveFindPackage -> #0x246 entry 1492 sets _moveType = NPCSchedule -> SetScheduleMovePath -> he walks to the current slot -> MoveEndLogic 2201 -> ReadyToNPCScheduleActionPackage. His routine resumes by itself.
+
+Recommendation: send OnResetNPCSchedule on every camp-actor Dismiss, not only when 'dropped'. It clears the follow move types.
+
+STAGESTART EXPERIMENT. Remove it. Its handler #0x1FE sets _nextAIMoveType = WorldMapRoadRoaming, which leads to road roaming via #0x246 entry 1479, not following. Its DisableNPCSchedule also makes departure permanently FALSE: 0x20863A0 returns eErrNoNPCScheduleDisabled. Possible leftovers are covered under findings.
+- [high] AI chart condition results use 0 = TRUE, 1 = FALSE, 2 = undecided.
+    And 0x22D61E0 returns the first nonzero sub-result (0x22D6256..0x22D6265), otherwise 0. Or 0x22D6290 returns 0 at the first zero (0x22D6316/0x22D634D), otherwise 1, or 2 if any sub-result was 2 (0x22D631A..0x22D6333). Not 0x22D6490 maps 0->1, 1->0, anything else ->2. AIFunctionOrBranch runs the branch only when the result is 0 (0x2436949 call 0x22D5EC0; test al,al; je 0x243695D). CheckAccompany 0x22EA740 returns 0x17EC1B0(actor) xor 1. CheckExist returns 0 when the schedule exists.
+- [high] CheckToDepartureNextNPCSchedule: class .?AVAICondition_CheckToDepartureNextNPCSchedule@pa@@ (type descriptor 0x6B6E7F0, COL 0x5ECA0E8), vtable 0x58C01A0, type id 0x217 (vt+0x10 = 0x22E38A0 'mov eax,0x217'). Evaluate = vt+8 = 0x22E38B0, a 5-byte jmp stub in plain code into protected .xtls 0xEBD4180. Signature: uint8_t(self rcx, runner rdx, ctx r8). The only reference to the stub is the slot 0x58C01A8.
+    RTTI walk (vtof). vtable dump (vtd.py). callers.py shows 0x22E38B0 has no call/jmp references; its only qword reference is 0x58C01A8, and 0xEBD4180's only caller is the jmp at 0x22E38B0. The generic evaluator 0x22D5EC0 calls [rax+8] at 0x22D5FEA with rcx=cond, rdx=r13 (runner), r8=r14 (ctx).
+- [high] Departure logic: true (0) when the slot the clock says should be active differs from the current slot. False (1) on any schedule error, including a disabled schedule.
+    .xtls 0xEBD4180: ai=[[rdx+0x68]]; calls 0x20863A0(ai, &err, ctx, &pair=0xFFFF) at 0xEBD41A1. err!=0 -> al=1 (0xEBD41AD). pair byte ==0xFF -> 0. pair == ctx+0x2E8/+0x2E9 -> 1 (0xEBD41C8..0xEBD41D6). Otherwise 0. Inside 0x20863A0: ctx+0x2D0==0 or +0x2D4/+0x2D8==-1, or entry+0x7D==0 / +0x7F!=0 -> eErrNoInvalidNPCScheduleInfo 0x6CF7154. ctx+0x2EC!=2 -> eErrNoNPCScheduleDisabled 0x6CDD1D8 (0x2086436). No game time (0x21A1DA0) -> 0x6CF7D54. No field (0x17FA6C0) -> 0x6CF6B54. Slot computed by 0x1815E40 at 0x208663D. A group-leader variant at 0x2086696 (via .xtls 0x17EEF70) reads the leader's [ai+0x90].
+- [high] CheckExistNPCScheduleInfo: vtable 0x58C2200, type id 0x20B, evaluate stub 0x22E3200 -> protected .xtls 0xEBCE770, slot 0x58C2208. It has no helper function. Returns 0 only if ctx+0x2D0!=0, +0x2D4!=-1, +0x2D8!=-1, entry+0x7D!=0, entry+0x38!=0 and ctx+0x2EC==2; otherwise 1.
+    Disassembly of 0xEBCE770..0xEBCE7DF (pure reads of r8; the entry is [ctx+0x2E0]+0x50 + idx*0x140). The vtable dump gives +0x10 = 0x22E31F0 'mov eax,0x20B'.
+- [high] No timer exists; the stay is game-clock based. The persistent client schedule state is S=[ai+0x90] (CommonAiActorComponent+0x90). Each handler or update copies it into a context struct built on the stack. Writing that context is impossible, and writing S is racy and leaves things to undo, so the hook is the right tool.
+    0x2083470 builds ctx (rsi) from ai (rbx): ctx+0x3B8=ai+0x18 (0x20836D5); ctx+0x2D0 <- 0x15EE200(S+8) (0x2083723); ctx+0x2E8 <- *(u16*)S+0x10 (current slot); ctx+0x2EA <- *(u16*)S+0x18 (next slot); *ctx+0x368 <- 32 bytes at *S+0x20; ctx+0x2EC <- S+0x66 (enabled = 2); ctx+0x370 <- S+0x65; ctx+0x374/0x378 <- S+0xF0/0xF4 (0x2083705..0x20837B9). 0x20863A0 computes elapsed time as S+0x30 + (now - stamp at *S+0x28 {day,h,m,s}), mod 86400 (0x2086533..0x2086593). The action played is chosen from ctx+0x2E8/0x2E9 (.xtls 0xCF6C480). Writing *S+0x10 would also change the action and every Current* condition. Setting S+0x66 to non-2 (what DisableNPCSchedule does) makes departure FALSE. Shifting S+0x30 makes RefreshNextSchedule store a later slot. The plugin runs on the server thread, while S is client AI data.
+- [high] Forcing departure alone is not enough. The re-decision can pick the next schedule entry over following, because nothing in it tests the accompany type.
+    WaitPackage InitLogic #0x334 (nested decode, nest.py), in order: ... 1705 CheckNextNPCScheduleLocationType#5 -> ReadyToNPCScheduleActionPackage; IF CheckExist {IF Or#310 -> ReadyToNPCSchedule; CheckExist -> CommonMoveFindPackage}; Or#630 FindTarget; CheckActor#17 SummonerWait; And#791(IsInParty, CheckActor#1) -> LeaderWaitPackage; Wait. Morrow's CommonMoveFindPackage is chart entry (1,5), record at pai 0x29F77, InitLogic state 0x2C4 -> #0x246: 1461 Or#310 -> ReadyToNPCSchedule; 1483 _moveType==NPCSchedule/RandomMoveActionSchedule -> SetScheduleMovePath; 1488 party member && CheckMyLeaderDoFormation -> FormationMemberMoveWait; 1491/1492 CheckExist -> _moveType=NPCSchedule -> SetScheduleMovePath. NPCScheduleEndAction #0x2FE: MainScheduleType -> Miseenscene; CurrentLocationType#8 -> CommonMoveFind {_moveType=RandomMoveActionSchedule}; otherwise CheckPoint#0. MoveEndLogic #0x2B2: 2201 / 1510 -> ReadyToNPCSchedule when _moveType is a schedule type. CompareValue operands resolved: string param #13 -> ShareValueKey#71 _nextAIMoveType, #22 -> #72 _moveType (pai 0x2C66B4/0x2C6605).
+- [medium] The conditions to force, and their no-schedule answers (all 1): CheckExist 0x20B, CheckCurrentNPCScheduleLocationType 0x21A, CheckMainScheduleType 0x21B, CheckNextNPCScheduleLocationType 0x225, CheckNPCScheduleSpawnAction 0x22E, optionally CheckNPCScheduleInitialAIControlType 0x230. Departure 0x217 is forced to 0. These are the Morrow-chart uses that matter.
+    Invalid-schedule returns: 0xEBCE7DD, 0x22E3A34, 0xEBD88C7, 0xEBE2BB4, 0x22E47CE and 0xEBF2240 all return al=1. Morrow uses (morrow_states.py): 0x217 in #0x4B, 0x246, 0x2E7, 0x2EB, 0x2EC, 0x2EE, 0x2FC; 0x20B in 14 containers; 0x21A in 230 (including the OnParty_FormationMoveStart #0x102D guard 'LocationType#0 -> return'); 0x21B in 10; 0x225 in 6; 0x22E in 3 (#0x246, 0x2E4, 0x334); 0x230 in OnAi #0x11B4 (-> WaitPackage BattleLoopSpawn). The vtable slots and their unique references were checked: 0x58C01A8, 0x58C2208, 0x58C0170, 0x58C0288, 0x58C0058, 0x58BFED0, 0x58BFCA0.
+- [medium] The exit path once forced: NPCScheduleAction -> NPCScheduleActionWait (no action; waits for the current schedule action's end, with a watchdog) -> NPCScheduleEndActionPackage (RefreshNextSchedule, IngEnd action) -> CheckPoint#0 -> a schedule-free re-decision. Action points end the same way.
+    Package 219 states (pkgs.py): NPCScheduleAction 0x262 OnUpdate #0x2EC = BRANCH 888 CheckToDeparture -> NPCScheduleActionWait (0x62A008E6); OnStateLeave #0x2E9 = ClearNPCScheduleSpawnAction. NPCScheduleActionWait 0x263 has no action and only OnActionEnd_Upper #0x2F0 -> NPCScheduleEndActionPackage. NPCScheduleEndAction 0x270 plays AIActionChart_NPCScheduleIngEndAction#1; enter #0x2FC And#710(NOT MainScheduleType, CheckToDeparture) -> RefreshNextSchedule. Chart-level OnWatchdog_ActionEndTimeOut -> #0x4. ActionPointActionPackage (0,24) state 0x4C OnUpdate #0x4B: statement C48 = CheckToDeparture -> ActionPointEndAction. CheckPoint body .xtls 0xC63E830 jumps to the saved checkpoint (0x207BBF0 -> 0x2073470) or restarts the chart.
+- [high] The client-side context: runner+0x68 -> holder; [holder] = AI component (ClientAiActorComponent, vtable 0x55B8448; ServerAiActorComponent 0x5B28988 for server-run AIs); ai+8 = owner actor; actor+0x60 = actor key; character index = [[actor+0x68]+0x20]+0x30.
+    CheckAccompany 0x22EA744..0x22EA74B and 0x17EC206..0x17EC20E (client-side code). 0xEBD4186 passes [[rdx+0x68]] as the AI to 0x20863A0, which uses [rdi+8] as the actor and [rdi+0x90] as S. The plugin already reads actor keys at actor+0x60 on client actors (game.cpp 452-464, 2336).
+- [high] Non-protected alternatives to the vtable swap: the generic evaluator 0x22D5EC0 (plain code; funnel for AIBranch 0x24372B0, AIFunctionOrBranch 0x2436860, And/Or/Not and 21 other sites), or the departure helper 0x20863A0 (plain code; 8 callers, so it would need a return-address filter on 0xEBD41A6; it does not cover CheckExist).
+    callers.py: 0x22D5EC0 has 24 call sites (21 in .rsrc, 3 in .xtls). 0x20863A0 is called from 0x1716FF5, 0x171731F, 0x1720C92, 0x172F710, 0x22E4D9B, .xtls 0xC6190A4 (RefreshNextSchedule), 0xEBD41A1 (departure) and 0xEBE2B15 (NextLocationType).
+- [medium] The undo works by itself. After the key is removed and the Resync + OnResetNPCSchedule are sent, he walks back to his current schedule slot and resumes. The hook changes no game data. The only write it triggers is the vanilla RefreshNextSchedule storing the slot the clock gives.
+    #0x1F4 = _nextAIMoveType=None, _moveType=None, RefreshNextSchedule, ValueInit#49, guard, CheckPoint#0. RefreshNextSchedule .xtls 0xC619070: 0x20863A0 at 0xC6190A4, *S+0x18=pair at 0xC619175, ai vt+0x368 at 0xC61917B, ctx+0x2EA at 0xC6191C7. Path back: #0x334 CheckExist -> CommonMoveFind -> #0x246 1492 _moveType=NPCSchedule -> SetScheduleMovePath -> #0x2B2 2201 -> ReadyToNPCScheduleActionPackage.
+- [medium] The StageStart experiment was the wrong tool, and it may have left disabled schedules on the 3 comrades it was raised on until a reload.
+    #0x1FE: SetPlayerSensibleByAIChart, _PlayerSensibleState=NoUse, ValueInits, conditional ApplySkill#17/#18 and EnableBattleBoundary, DisableNPCSchedule, guard OperatorValue#12 -> return, then BRANCH {_nextAIMoveType=WorldMapRoadRoaming,_moveType=None} -> SetWaitPackage, leading to CommonMoveFind 1479 road roaming. DisableNPCSchedule .xtls 0xC61D420: if ctx+0x3B8==ai+0x18 it writes S+0x66 = 0 or 1 (0xC61D538) and ctx+0x2EC (0xC61D549), then sends 0x8F3 (vt+0x2B0 at 0xC61D5ED); the server re-runs it on its own AI. With S+0x66 != 2, departure is permanently FALSE and CheckExist is FALSE. S+0x66 is set back to 2 only by schedule re-init: 0x20853D0 (CommonAiActorComponent vt+0x358; ClientAi override 0x91CD90), driven by packet 0xB3A TrocTrInitializeNPCScheduleAck (handler 0xC0CE50 -> call at 0xC0D235), which runs the reset at 0xDB94B86 via stub 0x1EB83D0; or by the constructor 0x1EB7B70 (0x1EB7ED5) at respawn or reload. Not verified in game whether the client branch ran.
+ACTIONS:
+ - game.cpp: add the condition-slot table (slot RVA, expected original, type-function bytes, forced value) for 0x58C01A8->0x22E38B0 (forced 0), 0x58C2208->0x22E3200, 0x58C0170->0x22E39B0, 0x58C0288->0x22E3A50, 0x58C0058->0x22E3F10, 0x58BFED0->0x22E4710 (forced 1), and optionally 0x58BFCA0->0x22E49B0 (forced 1). Install them in Init next to SLOT_SAFE_SPOT with VirtualProtect + InterlockedCompareExchangePointer. Before swapping, verify *slot == base+original and that the vt+0x10 bytes are 'B8 <type id> 00 00 C3' (0x217/0x20B/0x21A/0x21B/0x225/0x22E/0x230). Log and skip on any mismatch.
+ - game.cpp: add a detour template<int I> with typedef uint8_t(__fastcall*)(uintptr_t self, uintptr_t runner, uintptr_t ctx). It returns the forced value when ScheduleHidden(runner), otherwise calls the original. ScheduleHidden: fast path on g_hiddenCount; key = R32(R64(R64(R64(runner+0x68))+8)+0x60) with null checks and key != 0; compare against g_hiddenKeys[4]. No logging inside: it runs on the client AI thread for every NPC.
+ - game.cpp: add static volatile LONG g_hiddenKeys[MAX_COMRADES] and g_hiddenCount, plus HideSchedule(actorKey) / ShowSchedule(actorKey) using InterlockedExchange and InterlockedIncrement/Decrement. Call HideSchedule in Look() at PHASE_ASKED when Following(type) and SpawnType(c, m->actor) == 0xC, replacing the DropRoutine block (~1609-1616). Call ShowSchedule first thing in DismissHeld's camp-actor path (before g_removeAccompany), in Release(), when m->actor changes (fast travel), and in clean-up.
+ - game.cpp: delete the DropRoutine/StageStart experiment (g_dropRoutine, routineDropped, EVENT_STAGE_START, PHASE_REFOLLOW use). In DismissHeld, raise OnResetNPCSchedule (0x99DB94AD) about 1 s after Resync for every spawn-0xC dismiss, not only when 'dropped'. It resets _moveType/_nextAIMoveType and refreshes the next slot so his routine resumes.
+ - Research log (GC_RESEARCH only, server thread, read-only): at Recruit and Dismiss, log the server AI's schedule state S=[[[actor+0x68]+0x58]+0x90]: +0x66 (2 = enabled), *(u16*)S+0x10 (current slot), *(u16*)S+0x18 (next slot). This shows whether a comrade still carries a disabled schedule from the StageStart test.
+ - Tell the user to reload the save from before the StageStart tests (none was saved) before testing the hook, so no comrade keeps a disabled schedule (S+0x66 != 2) or _nextAIMoveType=WorldMapRoadRoaming.
+ - Test plan: recruit a comrade who is mid-task (sitting or working). Expected within about 1 chart tick plus the end animation (seconds): he stands up, runs NPCScheduleEndAction, then re-decides with no schedule and follows. Dismiss: expect him to walk back to his schedule spot and resume. Also try a comrade on a random-walk schedule (location type 8) and one using an action point (bench).
+OPEN:
+ - Not proven statically: whether a recruited camp comrade is an AI party member (IsInParty / CheckPartyLeaderOrMember#1), which LeaderWaitPackage and the formation moves need. The evidence that he follows once the schedule is hidden is indirect: vanilla comrades follow right after their routine ends, and schedule-less summoned (0xE) copies follow at once. That copies have no schedule (S+8 empty, no 0xB3A) is inferred, not read.
+ - How long NPCScheduleActionWait waits depends on each schedule action's end in the character action chart (paac), which was not decoded. It is bounded by the OnWatchdog_ActionEndTimeOut -> CheckPoint mapping; the timeout value is unknown.
+ - A comrade inside NPCSchedule_MiseensceneLogicPackage wait states (#0x2F5/#0x2F6) is not released by any forced condition, since those states do not test departure. Camp comrades probably never use mise-en-scène schedules; unverified.
+ - After Dismiss, if he is still a party member with the player as formation leader, CommonMoveFind entry 1488 (formation member) comes before the schedule move, so he could keep following. The PartyLeave guards in #0x21E/#0x1C2 exclude hired comrades. This needs an in-game check and concerns the Dismiss track.
+ - Whether the StageStart test actually disabled the 3 comrades' schedules (client S+0x66, and on the server via the 0x8F3 re-run), and whether a save would persist that in NPCScheduleCharacterSaveData. The proposed read-only log of S+0x66 would answer it.
+ - _isPositiveInteraction is set in OnAi only when roaming or when CheckExist is true. With CheckExist forced false it will not be set after a chart restart. Its only chart readers are sequencer/patrol events, and code does not read it by name, so the risk looks low but was not ruled out.
+===== verify:routine
+HOLDS AI chart condition results use 0 = TRUE, 1 = FALSE, 2 = undecided.
+    Re-disassembled. And 0x22D61E0 returns the first nonzero sub-result (0x22D6256 test/jne 0x22D6265), otherwise 0 (0x22D6263). Or 0x22D6290 returns 0 at the first zero (0x22D6318 -> 0x22D634D), otherwise 1, or 2 if any sub-result was 2 (0x22D631A cmove, 0x22D6330 setne, inc). An empty Or gives 1 (0x22D6351). Not 0x22D6490 maps 0->1, 1->0, anything else -> 2 (0x22D64F0..0x22D650E). AIFunctionOrBranch skips the branch on nonzero (0x2436949 call 0x22D5EC0; 0x243694E test al,al / je 0x243695D). CheckAccompany 0x22EA74F calls 0x17EC1B0 and then xor al,1 (0x22EA754).
+HOLDS CheckToDepartureNextNPCSchedule: vtable 0x58C01A0, type id 0x217, Evaluate stub 0x22E38B0 -> .xtls 0xEBD4180, only reference is the slot 0x58C01A8.
+    Confirmed. The COL at [0x58C01A0-8] = 0x5ECA0E8 has type descriptor 0x6B6E7F0 = .?AVAICondition_CheckToDepartureNextNPCSchedule@pa@@. [0x58C01A8] = 0x1422E38B0. vt+0x10 = 0x22E38A0, bytes B8 17 02 00 00 C3. 0x22E38B0 is jmp 0xEBD4180. A scan for E8/E9 calls into 0x22E38B0 finds none, and the only qword reference is 0x58C01A8. 0xEBD4180 is reached only by that jmp. The evaluator 0x22D5EC0 sets rcx=r15 (cond), rdx=r13 (runner), r8=r14 (ctx) and calls [rax+8] at 0x22D5FEA. A result cache exists (0x22D5FCA..0x22D5FD6), but it is used only while the debug flag [0x6CFA358] is set, and it is kept in the per-tick ctx+0x388, so it does not get in the way.
+HOLDS Departure logic: 0 when the clock slot differs from the current slot; 1 on any schedule error including disabled.
+    0xEBD4186..0xEBD41A1 calls 0x20863A0([[rdx+0x68]], &err, ctx, &pair=0xFFFF). err!=0 gives al=1 (0xEBD41AD). Either pair byte equal to 0xFF gives 0 (0xEBD41BD/0xEBD41C6 -> 0xEBD41D8). pair == ctx+0x2E8/+0x2E9 gives 1 (0xEBD41C8..0xEBD41D6). Anything else gives 0. Inside 0x20863A0: the checks on +0x2D0/+0x2D4/+0x2D8 (0x20863D3..0x20863EE), entry+0x7D/+0x7F (0x2086418/0x208642B), +0x2EC==2 -> [0x6CDD1D8] (0x2086436/0x208643F), game time 0x21A1DA0 -> [0x6CF7D54] (0x208647A/0x2086483), field 0x17FA6C0 -> [0x6CF6B54] (0x20864AE/0x20864BA), and slot 0x1815E40 at 0x208663D are all present. I did not check the group-leader variant at 0x2086696.
+HOLDS CheckExistNPCScheduleInfo: vtable 0x58C2200, type id 0x20B, stub 0x22E3200 -> .xtls 0xEBCE770; returns 0 only if all schedule fields are valid and +0x
+    [0x58C2208] = 0x22E3200 (jmp 0xEBCE770). The type descriptor 0x6B6EB48 names CheckExistNPCScheduleInfo. vt+0x10 0x22E31F0 = B8 0B 02 00 00 C3. The body 0xEBCE770..0xEBCE7DF only reads r8 and never touches rdx. The first entry+0x7D index uses an obfuscated multiplier (0x4D000040 - [0x9C3DE74]); the +0x38 test uses idx*0x140. It returns 1 at 0xEBCE7DD and 0 at 0xEBCE7DA.
+HOLDS No timer; stay is game-clock based; S=[ai+0x90] is copied into a stack ctx; writing S is racy, so the hook is right.
+    The copies are as stated: 0x20836D5 ctx+0x3B8=ai+0x18; 0x208372E 0x15EE200(ctx+0x2D0,[S+8]); 0x2083741 and 0x2083756 write +0x2E8/+0x2EA; 0x2083782 writes +0x2EC <- S+0x66; +0x370/+0x374/+0x378 at 0x2083793..0x20837B9. Elapsed time is S+0x30 plus the time since the stamp at *[S+0x28], wrapped with +0x15180 (86400) (0x2086533..0x2086587). Correction for anyone writing code from this: the current and next slots are *(u16*)[S+0x10] and *(u16*)[S+0x18], i.e. reached through pointers (0x208373A mov rcx,[rax+0x10]; movzx eax,word [rcx]), not u16 fields at S+0x10/+0x18. The 'hook is the right tool' part is a design judgement, not something the code proves.
+HOLDS Forcing departure alone is not enough: the re-decision can pick the next schedule entry over following, because nothing in it tests the accompany type
+    Re-decoded WaitPackage InitLogic container 0x334. In order: 1705 BRANCH CheckNextNPCScheduleLocationType#5 -> ReadyToNPCScheduleActionPackage; 1846 IF CheckExist {2793 IF OR(SpawnAction#0..3, AND(MainScheduleType, NOT IsMiseensceneScheduleStarted)) -> ReadyToNPCSchedule; 2611 CheckExist -> CommonMoveFindPackage}. All of these come before 2798 IF AND(IsInParty, CheckActor#1) -> LeaderWaitPackage. CommonMoveFind 0x246: 1461 -> ReadyToNPCSchedule; 1491/1492 CheckExist -> _moveType=NPCSchedule -> SetScheduleMovePath (hash 799045996). Caveat: forcing does not cover 1483 (OR CompareValue#152/#216 -> SetScheduleMovePath). If the re-decision lands in CommonMoveFind while _moveType is still NPCSchedule from before the recruit, he goes back to his schedule path whatever the conditions are forced to. The user saw him follow after the stay ended naturally, so following after a re-decision does happen.
+REFUTED The conditions to force and their no-schedule answers (all 1): 0x20B, 0x21A, 0x21B, 0x225, 0x22E, optionally 0x230; departure 0x217 forced to 0. These
+    Each slot, its expected original and its vt+0x10 type-id bytes check out (0x58C2208->0x22E3200 0x20B, 0x58C0170->0x22E39B0 0x21A, 0x58C0288->0x22E3A50 0x21B, 0x58C0058->0x22E3F10 0x225, 0x58BFED0->0x22E4710 0x22E, 0x58BFCA0->0x22E49B0 0x230). The invalid-schedule returns are all 1 (0xEBCE7DD, 0x22E3A34, 0xEBD88C7, 0xEBE2BB4, 0x22E47CE, 0xEBF2240). But the set is not shown to be the right one. (1) Forcing 0x21A to 1 blocks the action-point exit: in ActionPointAction OnUpdate 0x4B, the departure test (stmt 191 -> RefreshNextSchedule, 193 -> ActionPointEndAction) sits inside IF OR(CheckCurrentNPCScheduleLocationType#1,#2,#3) (stmt 190), so with 0x21A forced to 1 it is never reached. (2) NPCSchedule_MiseensceneLogicPackage's main action has no departure test. It leaves only through OnMiseensceneScheduleEnd (0x2F0) or ErrorWait (0x2E7), so a mise-en-scene routine is not cut short. (3) Departure also leads to RefreshSchedulePackage from NPCScheduleGroupWaitAction/ErrorWait (0x2E7) and NPCScheduleFindActionPoint (0x2EB, AND CompareValue#71). Those paths were not analysed.
+REFUTED Exit path once forced: NPCScheduleAction -> NPCScheduleActionWait -> NPCScheduleEndActionPackage -> CheckPoint#0 -> schedule-free re-decision. Action 
+    The NPCScheduleAction part is confirmed: 0x2EC BRANCH departure -> 0x62A008E6 NPCScheduleActionWait; 0x2F0 (ActionWait OnActionEnd_Upper) -> NPCScheduleEndActionPackage; 0x2FC enter AND(NOT MainScheduleType, departure) -> RefreshNextSchedule; 0x2FE: MainScheduleType -> Miseenscene, CurLocType#8 -> CommonMoveFind, otherwise CheckPoint#0 (stmt 4). With the forced values it reaches CheckPoint#0. 'Action points end the same way' is refuted. Container 0x4B has no 'statement C48'. Its departure test (stmt 191) is nested under several gates (CompareValue#44, NOT CheckSequencerCommuteTime, CheckAITaskActionPointTimer, the PreemptedActionPoint chain, and OR(CurLocType#1..3)), and forcing 0x21A shuts the last of those. I did not decode the CheckPoint body (.xtls 0xC63E830), nor whether the saved checkpoint can be CommonMoveFind, where a stale _moveType matters. 'Within seconds' is also unproven: ActionWait waits for the running action's OnActionEnd_Upper or the watchdog (#0x4).
+HOLDS Client-side context: runner+0x68 -> holder; [holder] = AI component; ai+8 = actor; actor+0x60 = key; character index = [[actor+0x68]+0x20]+0x30.
+    0x22EA744..0x22EA74B ([rdx+0x68] -> [rax] -> [rcx+8]) and 0x17EC206..0x17EC20E ([[actor+0x68]+0x20]+0x30 as u16) match. SpawnAction 0x22E4727/0x22E477D and departure 0xEBD4186 use the same chain. The plugin already reads client actor keys at +0x60 and uses them on the server (game.cpp 2075, 1671). Caveat: 0x20B, 0x21A, 0x21B and 0x230 (0xEBCE770, 0x22E39B0, 0xEBD8860, 0xEBF21D0) never read rdx, so the code does not guarantee that runner+0x68 is valid for every caller of those conditions.
+HOLDS Non-protected alternatives: generic evaluator 0x22D5EC0 (24 call sites) or departure helper 0x20863A0 (8 callers, filter on return 0xEBD41A6, does not
+    Counts reproduced: 0x22D5EC0 has 21 call sites in .rsrc and 3 in .xtls (0xC650414, 0xF597081, 0xF5ADB43). 0x20863A0 has 8 callers, exactly the listed ones. Both functions are plain code, outside .xtls.
+ACTION REVIEW: Scratch work is in <scratchpad>\gca\wf8\skeptic_routine\ (slots.py, callers_out.txt, nest1-4.txt, eval.txt, ctx.txt, f20863A0.txt).
+
+ACTION 1 (slot table): sound. All 7 slots hold the expected original, and the vt+0x10 bytes are B8 <id> 02 00 00 C3 (0x217/0x20B/0x21A/0x21B/0x225/0x22E/0x230). The vtables are in the same section as SLOT_SAFE_SPOT (0x5B2C848), which the plugin already swaps with VirtualProtect + InterlockedCompareExchangePointer, so there is precedent. Nothing in .xtls is patched: the stubs at 0x22E3xxx/0x22E4xxx are plain code and are only called as the originals. The patch is runtime only and nothing goes into the save. Keep the verify-then-skip guard. Re-think the set:
+- Do NOT force 0x21A unconditionally. It blocks the action-point departure path (0x4B stmt 190-193). If the OnParty_FormationMoveStart guard ('LocationType#0 -> return', #0x102D) still needs it, force only when the condition's compared type byte [self+8] == 0. 0x22E3A28 compares the entry's type with [r10+8], so the detour can read self+8.
+- Mise-en-scene routines will not stop: NPCScheduleMiseensceneAction has no departure test.
+
+ACTION 2 (detour): crash risk. game.cpp R64/R32 (line 236) are raw dereferences. For 0x20B/0x21A/0x21B/0x230 the original code never touches rdx, so following runner+0x68 -> [ ] -> +8 -> +0x60 brings in reads the game itself never makes, across 24 evaluator call sites (server 0x2AC7FC0, sequencer, .xtls). Null checks do not protect against a non-holder pointer. Wrap the key read in __try/__except (the plugin already does this in ProbeCheck/ProbeTeleport), or only follow the chain after the g_hiddenCount fast path. Per-frame cost is fine: one load and a branch when nothing is hidden. Thread use is fine too: the detour only reads the volatile keys. Keep the 'no logging' rule.
+
+ACTION 3 (Hide/Show keys): fine. Interlocked writes from the server thread and plain reads on the client AI thread(s) are adequate. Make sure every Release/cleanup path calls ShowSchedule, otherwise an ex-comrade keeps a dead routine until the game restarts. Only an in-memory key list is involved, so nothing is saved.
+
+ACTION 4 (remove DropRoutine; OnResetNPCSchedule on every 0xC dismiss): agree. Container 0x1F4 is confirmed: _nextAIMoveType=None, _moveType=None, RefreshNextSchedule, CheckPoint#0 (stmts 1158/1159/192/4). Removing StageStart also removes DisableNPCSchedule, whose persistence is an open question (research notes: client 0x91E720 -> 0x91E010 may send it to the server). Caveat from earlier research: OnResetNPCSchedule has allow 0 and is rejected while he is on a horse or vehicle, in a sequencer, etc. Also, the stale _moveType=NPCSchedule problem exists at recruit time as well (CommonMoveFind stmt 1483 -> SetScheduleMovePath, not covered by forcing). The plan only clears it at dismiss.
+
+ACTION 5 (research log): flawed as written. (a) It reads the SERVER AI's S, but StageStart was forwarded to and run on the CLIENT AI (packet 0x8AA), so a disable done there will not show up in the server copy. Read the client AI's [ai+0x90] instead, or label the log 'server copy'. (b) The slots are *(u16*)R64(S+0x10) and *(u16*)R64(S+0x18), reached through pointers (0x208373A/0x208374F), not R16(S+0x10). (c) I did not verify that ServerAiActorComponent (0x5B28988)+0x90 is the same structure. The read itself is harmless on the server thread under GC_RESEARCH.
+
+ACTION 6 (reload the save): harmless and prudent, since it is unknown whether DisableNPCSchedule stays in NPCScheduleCharacterSaveData. '(none was saved)' cannot be checked from here. Advise backing up the save.
+
+ACTION 7 (test plan): tone down the expectations. The random-walk schedule (0x2EE departure -> ActionWait) and plain NPCScheduleAction should work. The action-point (bench) case will likely FAIL while 0x21A is forced. A mise-en-scene routine will not stop. 'Within seconds' is unproven: NPCScheduleActionWait waits for the running action's OnActionEnd_Upper or the ActionEndTimeOut watchdog (#0x4). Log how long it takes.
+
+Out of scope but still unaddressed from what the user saw: the summoned copy (spawn 0xE) still vanishes on DisbandByKeys, and recruits still have no map icons. None of these actions change either.
+===== research:dismiss
+SUMMARY: All of this is static research; nothing was run in the game.
+
+(1) Restoring the 64 m logout distance right after Dismiss is not what made him vanish. The clean-up sweep 0x2C37340 never looks at his camp, home or schedule point. For a camp NPC (spawn type 0xC) it measures how far he is from his spawner, which the log shows is the player (A0100001); for a summoned copy (0xE) it measures him from his leader, also the player. So a comrade standing 2 m from you is never logged out. He is logged out once he is at least 64 m from the player, the same rule every vanilla camp NPC follows. Keeping 1e6 until he is more than 100 m from the player (or 10 minutes have passed), as the Depart code now in game.cpp does, is the right rule. No "back home" condition is needed.
+
+(2) The summoned copy vanished because of DisbandByKeys itself. It sets the disbanded flag, then unsummons him at once (packet 0x80A, run at once or on the next tick), and also runs the safe-spot teleport, which the plugin skips only on the RemoveAccompany branch, not on Disband. Vanilla does exactly the same when you disband Damiane or Oongka from the companion quick slot: packet 0x9C7 → 0x2A33000 → DisbandByKeys. The game has no "walk away, then unspawn" path. The chart's Disband event only sets a return position and leaves the party. The 0x81B "go to safe area" timer is a teleport.
+
+The recommended Dismiss for a summoned copy uses only steps already seen working in game:
+- put him in Standby (set type 1 and raise the Wait event);
+- keep the 1e6 logout distance;
+- once he is more than 100 m from you (or you fast-travel), call DisbandByKeys with the safe-spot step skipped.
+
+He stays where you left him and is unsummoned where you cannot see it. Walking 2 km back to his camp is not possible with what the game has.
+
+(3) For a camp comrade, RemoveAccompany plus Resync restarts his chart. The restart goes from the OnAi handler (#0x11B4) to WaitPackage, whose start-up logic (#0x334) checks the NPC schedule before anything else, so he walks back to his routine. OnResetNPCSchedule is not needed unless DropRoutine sent StageStart; game.cpp already raises it only in that case.
+
+Scratch files are in <scratchpad>\gca\wf8\dismiss\: the disassembly dumps f2C37340.txt, l2C37B54.txt, f28F9A20.txt, f2152070.txt, f2151570.txt, f2BA10A0.txt, f2B99050.txt, f2B8FB10.txt, f2B8FC20.txt, f2B8E440.txt, f2C34820.txt, f2C35CA0.txt, f2A33000.txt and f2BB3190.txt, and the chart decoder dec.py (run it with a container number in hex). game.cpp was being edited by someone else during this run (timestamp 21:09; the Depart/WatchDeparted watch is new), so the actions below are written against that current version. I made no project edits.
+- [high] The clean-up sweep compares a camp NPC (spawn type 0xC) with the player's position, not with his home or schedule point.
+    The sweep is 0x2C37340. It switches on cc+0x2D0 at 0x2C3796F through the tables 0x2C3A154/0x2C3A128; types 1-9, 0xC, 0x26 and 0x27 go to 0x2C37B54. The reference key is [[npc+0x68]+0xB0]+0x2D8, read by 0x1F5C8E0 (called at 0x2C37C42, read at 0x1F5C90F); the log shows 'spawner A0100001' for Astin, Otto and Wybert's camp actor. That actor is found with 0x2A82150 (0x2C37C68), then its vt+0x160 and 0x206AE30 give its controlled character (0x2C37CAD/0x2C37CBD); 0x206AE30 is the same 'controlled character' call used at 0x21520A8. Its position comes from 0x17EB2C0 (0x2C37D13). Then 0x28F9A20(npc, refPos, box) at 0x2C37D56 returns 1 when cc+0x468 squared is at most the squared distance (0x28F9AB3/0x28F9BEE, setbe at 0x28F9C1C). If too far, 0x2C38E0F runs a second test from the field's actor (field+0x2E4 → 0x2B06090 → 0x2C38EA2) and the protected gate 0x28F30C0 (0x2C38EE5), then logs out with 0x2068340(npc, .., r8b=0x19, [0x6CF76F8]) at 0x2C38F14. No schedule or home position is read anywhere on this path. Only if the spawner key is 0 does it fall back to the cc+0x278 key (0x2C37DAB).
+- [high] Restoring 64 m right after Dismiss cannot log out a comrade standing next to the player, so it was not the instant vanish. He is logged out only once he is at least 64 m from the player, as every vanilla camp NPC is. The safe rule is: restore when he is more than 100 m from the player, or after a timeout. No 'back home' condition is needed.
+    Follows from the sweep finding above. Astin was 2.1 m from you at 18:54:42 and his logout distance went back to 64 m at 18:54:44.595. Wybert was 1.8 m away at 19:22:22. The second test and 0x28F30C0 can only prevent a logout, not cause one. Camp NPCs' default logout distance is 64 m (log: 'logout distance 64 -> 1000000'), so vanilla camp NPCs already vanish at 64 m from the player. The Depart code (DEPART_OUT_OF_SIGHT_M = 100, DEPART_MAX_MS = 10 min) is safe.
+- [medium] When a camp actor (0xC) is logged out, the logout is the protected 0x2068340 with reason 0x19. The game then drops his list entry and clears the record's actor key. That the NPC schedule spawns him again at his schedule point is inferred, not observed.
+    At the fast travel (18:58:33.497) Wybert's camp actor B010003A was gone: 'record actor 00000000, entry NO', list 4 → 3. The camp actors are spawned with the player as spawner (+0x2D8 = A0100001), which fits a schedule spawner that works around the player. No log yet shows the same character getting a new spawn-type-12 actor after a logout.
+- [high] DisbandByKeys on the summoned copy: it removes him from the list with disband=1, sets the disbanded flag, unsummons him at once and also runs the safe-spot teleport. The plugin's safe-spot skip covers only its RemoveAccompany branch, not Disband.
+    0x2BA10A0 maps character keys to indexes through [0x6D69A48] (0x2BA1150..0x2BA11EB), then calls 0x2151570(clan, err, &Span16, 1, 0, 0, 0) at 0x2BA1256..0x2BA1273. 0x2151570 calls 0x2152070(clan, actor, a4, 1) with r9b hard-coded to 1 (0x2151E80, 0x2151ED1..0x2151EDF). In 0x2152070, a4 leads to 0x1795490(cc, 0x100000, 1, 0.0, 0) and clan vt+0x188 = 0x2B99050 (0x215218A..0x21521B6), and r9b leads to vt+0x180 = 0x2B98E20 (0x21521BC..0x21521CA). 0x2B99050 compares R32([[actor+0x68]+0x118]+0x18) with [[clan+8]+0x60] (0x2B990B8/0x2B990CF). If equal, it calls 0x2B8FB10(clan, &err, mercNo = merc+0x20) at 0x2B99109; otherwise it logs him out at once with 0x2068340(.., 0x58, eErrNoUserRequestToLogout 0x6CDB938) at 0x2B9912A. 0x2B8FB10 posts TrocTrProcessUnspawnMercenaryOnceTimer 0x80A {0xFF, mercNo} (0x2B8FB45..0x2B8FBE9) through 0x27745F0. That function runs the handler at once when called on the handler's own thread (TLS+0x20C == desc+0x1C and r9b=0 → 0x2774730 at 0x2774628), otherwise it queues it with no delay. The handler 0x2C34820 calls 0x2B8FC20, which calls 0x2B8E440 'unsummonMercenarySummonStateWithCost'; that logs him out with r8b=0x58 at 0x2B8EB2C. In game.cpp, DismissHeld sets t_skipSafeSpot only around g_removeAccompany, so for Wybert 0x2B98E20 also ran. The log fits: his actor was still found at 19:22:24.591, when his logout distance was set back, so the logout had been requested but not yet completed.
+- [high] Vanilla disband of Damiane or Oongka from the companion quick slot is exactly the plugin's call, so they are unsummoned at once as well.
+    Packet 0x9C7 TrocTrDisbandMercenaryReq has its server handler at 0x2A33000. It reads a u8, which is not used afterwards, then u32 character keys up to the end of the payload (0x2A330C6..0x2A331CC). It checks the sender: [[a+0x88]+1]==1 and [a+0x96]!=0 (0x2A33225..0x2A33239). Then it calls DisbandByKeys 0x2BA10A0([[a+0x68]+0x110], &err, &keys) at 0x2A33251, and on error sends the fail ack 0x2A2CA00 (0x2A33298). The client side, from earlier research: quick-slot UI 0xEFD810 → 0x6508A0 → client clan 0x9DCC40 → 0xBE3870.
+- [high] The game has no 'walk away, then unspawn' path. The chart's Disband event changes no package, the 0x81B safe-area timer is a teleport, and the 0x80A unspawn timer is immediate.
+    OnParty_Command_Disband 0x8EC9E12C goes to container #0x21E in Morrow's chart 0xA17A8F3E (wf7 events list). Decoded with dec.py: SetReturnPositionToTarget#0; IF CheckMountedVehicle#2 → AIEventToProcessTarget#6; IF IsInParty#0 && !(Or#27: hired / accompanied / ...) → PartyLeave#0. There is no AIBranch, so no package or state change. TrocTrDisbandMecenaryGoToSafeAreaOnceTimer 0x81B (handler 0x2C35CA0) re-posts itself with delay [0x6D08A28] s through the protected 0x2774430 (0x2C35D69..0x2C35DEE) while actor+0xC3 == 0, then calls 0x2BA0A10 (0x2C35E04): safe spot 0x2B97DF0 (0x2BA0CB1/0x2BA0FE6) and teleport 0x2BCD120 (0x2BA1002). Its first poster is not in plain code; no 'mov reg,0x81B' exists outside the handler. SelfLogoutPackage (states SelfKillAction and Wait) is reached only from container #0xEF1. LogoutActionPackage is reached only from #0x340.
+- [medium] Taking a summoned copy off the list with RemoveAccompany (without Disband) leaves him summoned with the player as leader. While his logout distance is 1e6 the game never removes him. With 64 m restored, the sweep logs him out once he is at least 64 m from the player.
+    Nothing in 0x2151570 or 0x2152070 writes the merc component's +0x1C. The 0xE sweep case 0x2C38BA8 reads the leader from merc+0x1C (0x2C38BC7). If the leader is missing it logs him out at 0x2C38C2A (eErrNoInvalidSpawnOwnerActor 0x6CF75D4); otherwise 0x28FC0A0 → 0x2BB3190 (0x2C38CA7). The option byte MercenaryInfo+0x21 is 0 for Melee and Range comrades, which returns 1 only beyond the logout distance (earlier verified 0x2BB355F). Then the common test at 0x2C37D40/0x2C37D56 and the logout with r8b 0x19. Wybert's summoned copy, with logout distance 1e6, stayed alive for 24 min (18:58 to 19:22). The call-duration expiry 0x2B91090 covers only the clan+0x98 call list where charinfo+0x6E != 0xFFFF (0x2B911D8), not accompany summons.
+- [medium] What a summoned copy's chart does after RemoveAccompany and a Resync cannot be settled statically. He may stand, walk to a schedule, or keep trailing the player.
+    WaitPackage InitLogic #0x334 (dec.py) tries, in order: ReadyToNPCScheduleActionPackage (BRANCH#695 / #556); IF CheckExistNPCScheduleInfo → CommonMoveFindPackage (BRANCH#923); FindTargetPackage (BRANCH#963); IF CheckActor#17 → SetCurrentTarget#8 → SummonerWaitPackage (BRANCH#964); IF IsInParty && CheckActor#1 → LeaderWaitPackage (BRANCH#965); otherwise Wait. CheckExistNPCScheduleInfo's evaluate is protected (vt 0x58C2200 slot +8 → .xtls 0xEBCE770), and CheckActor's actor parameter was not decoded. So a summoned copy could follow the 'summoner' (the player).
+- [high] If needed later, the clean unsummon of a copy that is already off the list is 0x2B8FB10(clan, u32* err, u64 mercNo) with mercNo = record+0x28. Its preconditions are known.
+    This is vanilla's own call site 0x2B99109. 0x2B8FC20 finds the record with 0x2146170(clan+0x18, mercNo), which compares the map entry's u64 at +8 (0x21461B7), and checks record+0x28 != -1 and +0x20 != 0xFFFF (0x2B8FC76..0x2B8FC8A). mercNo equals R64([[actor+0x68]+0x118]+0x20) (0x2B990F0) and the plugin's Record.merc. 0x2B8E440 refuses while the player is dead or downed (owner cc+0x272/+0x273 → eErrNoPlayerIsFatalOrDead 0x6CF7D58, 0x2B8E4D1..0x2B8E4ED). It also refuses when the pre-check 0x2152570 fails (record+0xDD == 0 → eErrNoMercenaryCanBeUseAfterInitialize 0x6CF7A8C, 0x2152622; or he is downed). It saves his position into record+0xC8 (x and y as 8 bytes), +0xD0 (z), +0xD4 (a float from 0x17E9170) and +0xD8 (0x2B8E97E..0x2B8E99C), adds the record to clan+0x118 (0x2B8E9AA..0x2B8EA05), and logs him out with r8b 0x58 (0x2B8EB2C). It takes no plugin-held lock (the read lock 0x393DF0 is taken at 0x2B8FC56).
+- [high] For a camp comrade, RemoveAccompany with the safe spot skipped, followed by Resync, sends him back to his schedule. OnResetNPCSchedule is not needed when StageStart was not raised.
+    Resync 0x2BCCC00 → client 0x9FF390 → chart restart 0x206EED0 (0x9FF48A) and OnAi. OnAi #0x11B4 (dec.py) ends in BRANCH#1101 → WaitPackage, or FLOW#14 → CommonMoveFindPackage. WaitPackage InitLogic #0x334 tests the schedule branches (BRANCH#695, CheckExistNPCScheduleInfo#0 with CheckNPCScheduleSpawnAction#0..3 || (CheckMainScheduleType#0 && !IsMiseensceneScheduleStarted#0) → ReadyToNPCScheduleActionPackage, else CommonMoveFindPackage) before any party or leader branch. When StageStart was sent (#0x1FE: DisableNPCSchedule#0, _nextAIMoveType=WorldMapRoadRoaming), the only re-arm is OnResetNPCSchedule #0x1F4: guard CompareValue#148/#149; _nextAIMoveType=None; _moveType=None; RefreshNextSchedule#0; ValueInit#49; guard CheckAIPackageStateName#21/#22; AIBranch_CheckPoint#0. Whether it undoes DisableNPCSchedule is unverified.
+- [high] The Standby order needs her to still be on the list, and Standby is a proven way to make a summoned copy stand still with no catch-up teleport.
+    Container #0x21D (OnParty_Command_Wait 0xEEBE079C): IF !CheckAccompany#0 → return (0x71); SetReturnPositionToTarget#0; IF mounted → AIEventToProcessTarget#6; voice line; SetAccompanyType#1. notes.md, experiment 2: Max's summoned copy stood in Standby and was still alive 3315 m away with no catch-up. The plugin already raises Wait and sets the type to Standby (recruit log 'type Standby').
+ACTIONS:
+ - CAMP COMRADE (cc+0x2D0 == 0xC): keep today's sequence. (1) Do not dismiss while he is down or dead. (2) uint16_t idx = ch.index; Span16 s = {&idx,1,1}; uint32_t err = ~0u; t_skipSafeSpot = actorKey; g_removeAccompany(clan, &err, &s, 0,0,0,0) /*0x2151570*/; t_skipSafeSpot = 0. That removes the list entry, sends the client update through vt+0x178, and sets no flag, no unspawn and no teleport. (3) Release(..., keepLeash=true), so Depart keeps cc+0x468 = 1e6 and sets it back to the old value (64 m) with 0x28FA550(actor, old) once he is more than 100 m from you or after 10 min. No home condition is needed. (4) Resync: 0x2BCCC00(R64(R64(actor+0x68)+0x1A0), R32(base+0x6CDD478)). (5) Only if routineDropped (StageStart was sent): RaiseEvent(actor, 0x99DB94AD) 1000 ms later, as now. Never use DisbandByKeys on a 0xC actor: 0x2B99050 would unsummon him or log him out.
+ - SUMMONED COPY (cc+0x2D0 == 0xE), recommended change in DismissHeld: replace the immediate Disband(c, key) with 'stay behind, unsummon unseen'. (1) SetType(c, idx, TYPE_WAIT): 0x21523A0(clan, idx, 1) plus Ack 0x297EF40(owner, &Finder{0x5B25438, 0, owner->vt[0xE8](owner)}, 0x389570(&idx), &type). (2) RaiseEvent(c, actor, EVENT_WAIT 0xEEBE079C, "Standby"), sent while he is still on the list (#0x21D returns early otherwise); the expected result is 1,0 'sent to her client'. (3) Release(..., keepLeash=true) and mark the Departed slot summoned = true, saving key, index, mercNo = RecordOf(key)->merc (record+0x28) and his actor. (4) In WatchDeparted, every pump, for a summoned slot: if EntryOf(index) is gone, stop watching (the game removed him). If the entry type is back to 2..4 (vanilla Follow pressed), Undepart and adopt him again (Add + Adopt + Leash). If he is down or dead, or the player is dead, wait. If his distance from you is more than 100 m, or your own position jumped more than 100 m between two pumps (fast travel), or 10 min have passed: uint32_t k = key; Span32 s = {&k,1,1}; uint32_t err = ~0u; t_skipSafeSpot = actor; g_disband(clan, &err, &s) /*0x2BA10A0, the vanilla quick-slot call*/; t_skipSafeSpot = 0; ReadClan; log err. (5) Ignore a second Dismiss on a summoned copy that is already leaving (log only), so he never vanishes in view.
+ - SUMMONED COPY, alternative (experiment only, behind an ini switch, because his AI afterwards is unverified): raise Standby first as above, wait until the entry shows type 1 plus 500 ms, then RemoveAccompany(clan, &err, {idx}, 0,0,0,0) with t_skipSafeSpot = actor and NO Resync (a chart restart could send him to SummonerWaitPackage). Keep the 1e6 logout distance. When he is more than 100 m away, call typedef uint32_t* (__fastcall*)(uintptr_t clan, uint32_t* err, uint64_t mercNo) at 0x2B8FB10 with the saved mercNo (record+0x28). It posts 0x80A, and 0x2B8FC20 → 0x2B8E440 unsummons him. Server thread, no game lock held. Retry later if err is eErrNoPlayerIsFatalOrDead (0x6CF7D58).
+ - LOG-ONLY WATCH (extends the existing WatchDeparted and ProbeDistance; calls no game function). (a) At Dismiss, log: spawn type; mercNo; record +0x50 (actor) and +0xC4; record saved position +0xC8/+0xCC/+0xD0 (floats); merc component +0x18 (the owner key the unspawn check compares), +0x1C (leader) and +0x20 (mercNo); and his 'home anchor'. Use his position at Recruit time (store homeX/Y/Z in the Comrade at RecruitHeld and pass it to Depart); for a summoned copy use the record's saved position. (b) Every 1 s for 60 s, then every 5 s until he is gone: distance to you, metres moved, distance to the anchor, ai+0x18 (AI sequence), whether he is on the list and his type, the DISBANDED (0x100000) and HIDDEN (0x8000000) flags in cc+0x390/+0x394, and cc+0x468. (c) The existing ProbeDistance already logs 'too far' for watched actors (slots MAX_COMRADES..). Keep it, so a vanish caused by the clean-up shows as a 'first ... = 1' line with his logout distance just before 'actor gone'. (d) Optional log-only detours on plain code (verify the prologue bytes at these fixed RVAs). 0x2B99050 is better done as a pointer swap on clan vtable slot +0x188 at 0x5B2C850, as for the safe spot; prologue 48895C2408 48896C2410 4889742420 57 4883EC70 488BDA. Log the actor key, R32(merc+0x18) against the owner key R32(R64(clan+8)+0x60), and which branch runs (unsummon through 0x80A, or immediate logout). 0x2B8FC20 (prologue 48895C2410 48896C2418 4889742420 57 4883EC40 498BD8): log mercNo, *err after the call, and the return RVA (0x2C3485C = the 0x80A handler). (e) After 'actor gone', poll RecordOf(key) every 2 s for 10 min. When record +0x50 becomes a new actor key, log 'respawned as X', his spawn type, his position, and his distance from the anchor and from you. That confirms a camp comrade is spawned again at home.
+ - EXPECTED IN GAME. Camp comrade: entry gone at once; ai+0x18 changes within about 1 s of the Resync; 'moved' > 0 and the distance to the anchor shrinking (walking back to his routine); no too-far probe line until he is past 100 m and his logout distance is back to 64; then 'too far = 1' followed by 'actor gone'; later 'respawned as ..., spawn type 12' near the anchor. Summoned copy: type 1, moved about 0; at more than 100 m: 'DisbandByKeys -> 0', the 0x2B99050 probe shows the unsummon branch, the 0x2B8FC20 probe runs, 'actor gone'; record +0xC4 back to 0 and record +0x50 = 0; the saved position is where he stood.
+OPEN:
+ - What is merc component +0x18 on a summoned copy: the owner key A0100001, so the 0x80A unsummon branch of 0x2B99050, or something else, so an immediate logout? Either way he is gone at once. Watch item (a) or (d) will show it.
+ - After a camp actor is logged out by the clean-up, does the NPC schedule really spawn him again at his schedule point (record +0x50 getting a new key with spawn type 12)? No log shows it yet.
+ - After RemoveAccompany, does a summoned copy stand, follow you (SummonerWaitPackage through CheckActor#17), or walk toward a schedule? CheckActor's parameter and CheckExistNPCScheduleInfo (protected 0x22E3200 → .xtls) were not decoded. This only matters for the alternative experiment.
+ - Does DisableNPCSchedule (from StageStart, i.e. DropRoutine) survive Dismiss, or a save and reload, and does OnResetNPCSchedule re-arm it? It is unverified; test on a backed-up save.
+ - Is 100 m out of sight in practice? Vanilla NPCs are logged out at 64 m from the player, so 100 m is already past vanilla, but open terrain may still show him. A camera-facing test could be added if the user sees it happen.
+ - If the player saves while a summoned copy is waiting to leave (on the list in Standby), he reloads as a Standby companion. The plugin should either pick the departure watch up again on load or accept that.
+===== verify:dismiss
+HOLDS The clean-up sweep compares a camp NPC (spawn type 0xC) with the player's position, not with his home or schedule point.
+    Confirmed. The switch at 0x2C3796F/0x2C37986 sends type 0xC to 0x2C37B54 (byte table 0x2C3A154, index 1). r14 = [[npc+0x68]+0xB0] (0x2C37519), and 0x1F5C8E0 reads r14+0x2D8 (0x1F5C90F). The actor is found with 0x2A82150 (0x2C37C68), then vt+0x160 and 0x206AE30 (0x2C37CAD/CBD), and its position comes from 0x17EB2C0 (0x2C37D13). 0x28F9A20 returns 1 when cc+0x468 squared is at most the squared distance (0x28F9B21/0x28F9C1C). On a 1, 0x2C38E0F's second test (0x2C38EA2) and the gate 0x28F30C0 (0x2C38EE5) can only keep him; the logout is at 0x2C38F14. The log shows spawner A0100001 = the player. Three more logouts on this path ignore distance, all with r8b 0x19: the spawner actor is not found (0x2C37C8C), its controlled character is not found (0x2C37CE1), or the deadline cc+0x428 has passed (0x2C3760B..0x2C37645, eErrNoInvalidSpawnOwnerActor). If [npc+0x88]+1==7, a box is used instead of a point (0x2C3793B, 0x28F9AE8).
+HOLDS Restoring 64 m right after Dismiss cannot log out a comrade standing next to the player; restore at >100 m or timeout is safe.
+    Holds for the distance sweep: the reference is the player (above), and cc+0x428 was 0 in every log line. Two caveats. 'Only once he is at least 64 m away' is too strong: at 18:58:33 Wybert's camp actor B010003A was removed while his logout distance was 1e6, so some other path (the field change) also removes camp actors. And the 10-minute timeout in WatchDeparted (game.cpp 1197) restores 64 m even when he is 64-100 m away. The sweep then logs him out at once, possibly while you can still see him. Restore at the timeout only when he is well inside 64 m. The same applies to the 'full slot' restore in Depart (game.cpp 1110-1120). The 18:54-18:56 log never watched Astin or Otto after Dismiss, so it does not show what happened to them.
+REFUTED A camp actor (0xC) is logged out by the protected 0x2068340 with reason 0x19; the game drops his entry and clears the record's actor key; the respawn 
+    The observed case does not show the reason. At 18:58:33 B010003A vanished with logout distance 1e6, so it was not the sweep's distance logout (0x2C38F14), and the logging did not show which path ran. 0x19 appears at several sweep sites, but a field-change or unload path may use another one. The entry dropping and 'record actor 00000000' were observed (log lines 583-588). The respawn is unverified, as the claim admits.
+HOLDS DisbandByKeys on the summoned copy removes him with disband=1, sets the flag, unsummons at once and also runs the safe-spot teleport; the plugin's ski
+    Verified. 0x2BA1256..0x2BA1273 calls 0x2151570(.., r9b=1, 0,0,0). The 4th argument is [rbp+0x98] (frame lea rbp,[rsp-0x38] after 8 pushes); 0x2151E80 → 0x2152070 with r9b=1 (0x2151ED1). In 0x2152070, r8b leads to 0x1795490(0x100000) and vt+0x188 (0x215219F..0x21521B6), and r9b leads to vt+0x180 (0x21521CA). The vtable at 0x5B2C6C8 has +0x180 = 0x2B98E20 and +0x188 = 0x2B99050. 0x2B99050 compares the ids at 0x2B990B8/0x2B990CF, then calls 0x2B8FB10 (0x2B99109) or logs him out at once with 0x58 (0x2B9912A). 0x2B8FB10 posts 0x80A (0x2B8FB45/0x2B8FBDC) through 0x27745F0. That runs the handler at once on the same thread (0x2774613..0x2774628), or when desc+0x1C==0 (0x27746DE); otherwise it queues it. With no message object, it calls 0x2B8FC20 directly (0x2B8FB86). Disband() (game.cpp 802) never sets t_skipSafeSpot.
+HOLDS Vanilla quick-slot disband of Damiane/Oongka is exactly the plugin's call, so they are unsummoned at once too.
+    Packet 0x9C7 has its handler at 0x2A33000 (pkt_ids.txt). It checks the sender at 0x2A33225..0x2A33239 and calls 0x2BA10A0 at 0x2A33251 with the clan [[a+0x68]+0x110]. The client sender 0xBE3870 builds 0x9C7 (mov r8d,0x9c7 at 0xBE39CE). I did not re-trace the UI chain above 0xBE3870.
+REFUTED The game has no 'walk away, then unspawn' path (Disband event no package change, 0x81B is a teleport, 0x80A immediate).
+    The three sub-facts check out. #0x21E (dec.py) has no AIBranch. The 0x81B handler 0x2C35CA0 re-posts itself while [r8]+0xC3==0, then calls 0x2BA0A10 (0x2C35E04). That object is the clan owner (its +0x68 → +0x110 is the clan), so it waits on the player's flag, not the comrade's. 0x80A is effectively immediate. But a universal 'no such path' is not shown. #0x21E starts with SetReturnPositionToTarget#0, which hints that some other code uses a return position. 0x81B's first poster was not found. I did not re-check the claims about SelfLogoutPackage and LogoutActionPackage.
+REFUTED RemoveAccompany without Disband leaves a summoned copy summoned with the player as leader; with 1e6 he stays, with 64 m the sweep logs him out at 64 m
+    The sweep part is verified. Case 0xE (0x2C38BA8) reads the leader from merc+0x1C (0x2C38BC7) and logs him out if the leader is missing (0x2C38C2A). If 0x17FA6C0(leader)+0x10 == 0 he is kept (0x2C38C67). Otherwise 0x28FC0A0 → 0x2BB3190 decides (0x2C38CA7) and the common test runs at 0x2C37D40. 'Nothing writes merc+0x1C' was checked only in the two functions' own code, not in their callees (vt+0x178, 0x1F5AB60, 0x206EED0, 0x1794ED0, the clan+8 vt+0x188). The 24-minute survival (18:58-19:22) happened while he was ON the list, so it says nothing about a copy taken off it.
+HOLDS The clean unsummon of an off-list copy is 0x2B8FB10(clan, u32* err, u64 mercNo = record+0x28), with known preconditions.
+    Verified: 0x2B99109, 0x2B8FC63 → 0x2146170, the checks at 0x2B8FC76/0x2B8FC86, the dead/downed check at 0x2B8E4D1..0x2B8E4ED, the pre-check 0x2152570 (+0xDD at 0x2152622), the saved position at 0x2B8E97E..0x2B8E99C and the logout 0x58 at 0x2B8EB2C. Additions: 0x2152570 also refuses with error 0x6CF7A90 when record+0x50 == 0, i.e. no live actor (0x2152636 → 0x215279C). err=0 does not prove anything was posted: if 0x1439060 returns null and [0x6CDB8D0]==0, it returns 0 and does nothing (0x2B8FB72 → 0x2B8FBEE). The main work runs in a SqlGuard DB callback (0x2BB0CF0, 0x2B8E8BE), so it writes to the save and may finish later. A missing record gives a second logout with 0xD (0x2B8E915). 0x2B8FC20 releases its read lock (0x2B8FC9A) before calling 0x2B8E440.
+REFUTED For a camp comrade, RemoveAccompany (safe spot skipped) + Resync sends him back to his schedule; OnResetNPCSchedule not needed without StageStart.
+    Plausible but not shown. #0x334 (dec.py) does test BRANCH#695, #556 and #923 before #964 (Summoner) and #965 (Leader). But earlier branches can take over first: #505 CommonMoveFind under CondStmt#259, #545 FindTarget and #961 AiTaskRestart. Whether he goes to the schedule depends on CheckExistNPCScheduleInfo and CheckNextNPCScheduleLocationType, whose evaluators are protected, and on the schedule state the client holds. DisableNPCSchedule was checked only in #0x1FE, not in any other container. No log watched a camp comrade after Dismiss, so the claim is unobserved. 'High' confidence is not justified.
+ACTION REVIEW: CAMP COMRADE (action 1): acceptable. Server thread, nothing hooked in .xtls, and cc+0x468 is a runtime field. Fix one thing: the DEPART_MAX_MS fallback (game.cpp 1197) and the 'slot full' restore (1110-1120) set 64 m back whatever his distance. If he is 64-100 m away, the sweep (0x2C37D56 → 0x2C38F14) logs him out at once, possibly in view. At the timeout, restore only if he is under about 50 m; otherwise keep waiting for >100 m or a fast travel. Do not use DisbandByKeys on 0xC (agreed: 0x2B99050 either unsummons or logs out at once).
+
+SUMMONED COPY (action 2):
+(1) The '10 min passed → Disband' fallback contradicts 'never vanishes in view'. If you stay near him, he is unsummoned in front of you. Drop it, or require >100 m.
+(2) Until then he stays on the accompany list as type 1. He takes a party and quick-slot entry, he is subject to vanilla party handling (fast-travel re-summon, the 0x81B safe-area teleport), and a save made in that window stores him as a party member.
+(3) Setting t_skipSafeSpot to the actor key is right (SafeSpotDetour compares R32(actor+0x60)). Without it, Disband runs vt+0x180 0x2B98E20.
+(4) After a fast travel the game may already have removed or re-summoned him before your pump runs. Keep the 'entry gone → stop watching' rule, and make sure the lost/re-register logic never acts on a departing key.
+(5) DisbandByKeys still writes his position and summon state to the DB (SqlGuard at 0x2B8E8B6). This is vanilla behaviour, so nothing new stays in the save.
+
+ALTERNATIVE (action 3): keep it behind the ini switch, and it is the riskiest option. While he is off the list and summoned, with no disbanded flag, only the plugin can clean him up. If anything else logs him out first (field change, as at 18:58:33), record+0x50 = 0, 0x2152570 refuses with error 0x6CF7A90, and the record may stay 'summoned' (+0xC4 = 1) in the save. err=0 from 0x2B8FB10 does not prove a post happened (0x2B8FB72). Losing the Departed slot (the 'full' path) restores 64 m, and then the sweep logs him out with 0x19 instead of unsummoning him.
+
+LOG-ONLY (action 4): fine.
+- Null-check [[actor+0x68]+0x118] before reading +0x18/+0x1C/+0x20. 0x2B99050 reads it without a check (0x2B990B1), and camp NPCs may not have one.
+- The prologues match: 0x2B99050 48895C2408 48896C2410 4889742420 57 4883EC70 488BDA; 0x2B8FC20 48895C2410 48896C2418 4889742420 57 4883EC40 498BD8. Neither is a protected stub.
+- The slot +0x188 swap at 0x5B2C850 affects every server clan, but the cost is negligible.
+- 0x2B8FC20 is also called directly from 0x2B8FB86, not only from 0x2C3485C.
+- The record's saved position +0xC8 is only written at unsummon (0x2B8E97E), so before the first unsummon it is stale and not a 'home'.
+
+EXPECTED (action 5): hypotheses, not facts. 'record +0xC4 back to 0' and 'respawned as … spawn type 12 near the anchor' are unverified.
+
+Scratch: <scratchpad>\gca\wf8\skeptic_dismiss\ (sweep.txt, l2C37B54.txt, f28F9A20.txt, f2BA10A0.txt, f2151570.txt, f2152070.txt, f2B8FC20.txt, f2B8E440.txt, f2A33000.txt, f2BB3190.txt).
+===== research:map
+SUMMARY: The game picks every actor's map icon in one plain client function: 0x9E8D10. Its only caller is 0x9E89C0, which runs from ClientMinimapActorComponent::update (vt 0x55BEC90 slot +0xF8 = 0x9E7C60; the component sits at [actor+0x68]+0x160) and from the periodic CachedMapIconInfo_updateTask (vt 0x55BB768, run function 0x94FB30). That function is the only map code that reads characterinfo _uiMapTextureInfo (+0x1E6), so Damiane's world-map and minimap icon both come from it.
+
+Why Damiane and Oongka get an icon and comrades do not:
+- **Damiane and Oongka** have _playerIndex 2 and 3 (runtime +0x104). That sends them down a separate branch (0x9E9191 to 0x9E9276): if they are a valid owned mercenary of the player's clan (0x214E7A0, record +0x28 != -1 and +0x20 != 0xFFFF), they show their own texture from +0x1E6. Damiane uses Actor_Player_Damian (key 0x13F7), Oongka uses Actor_Player_Oongka (key 0x13F8).
+- **Camp comrades** have _playerIndex 0 and _spawnActorType 4 (Mercenary), like Damiane. Mercenary actors go to 0x9E99B1, which never reads +0x1E6. There the icon depends only on the mercenary record's state (0x214D130). State 1 (record +0xE2, the Follow-into-Combat flag) shows the generic Actor_Character icon. State 3 (+0xE4) shows Faction_OperationCharacterActor. Any other state shows nothing. The accompany list (clan+0xB8) is never consulted. Comrades also have _uiMapTextureInfo 0, which is not a valid key, so it reads back as no texture (0xFFFF).
+
+So a characterinfo edit alone cannot give recruited comrades an icon, and certainly not one shown only while they accompany you.
+
+Smallest working change: a client MinHook on 0x9E8D10 that changes the result afterwards. It is plain code with a unique 46-byte prologue. After the original call: if the result is "no icon", the icon was not hidden or removed on purpose, and the actor's key is one of the plugin's recruited comrades (g_tracked slots 0-3), set the texture to the game's Actor_Party_Default index. That index is read from UIMapTextureInfoManager+0x104. Actor_Party_Default is the game's own party-member icon: story Greymanes such as Macduff, Yann and Nairah carry it. Actor_Character (+0x100) could be an ini option; it is what the game shows for a Follow-into-Combat comrade, and 0x9EA6F0 attaches a label to it, probably his name. This covers camp actors and summoned copies, and the icon goes away by itself once Dismiss clears his tracked slot.
+
+Both icons are in the same never-filtered UI filter group as Damiane's (uifiltergroupinfo Group_Invisible 0xF424F), so the world-map legend will not hide them. None of this has been tried in the game yet.
+- [high] The only place that picks an actor's map texture is 0x9E8D10. Signature: void(comp rcx, focusActor rdx, clanOwnerActor r8, u16* tex r9, u8* decided [rsp+0x28], u8* groggy [rsp+0x30], u8* removed [rsp+0x38], u8* relation [rsp+0x40]). Its single caller is 0x9E89C0. That is called by ClientMinimapActorComponent's update and by the periodic cached map-icon task.
+    Call scan: only 0x9E8A6B calls 0x9E8D10. 0x9E89C0 is called from 0x9E7E3A (inside 0x9E7C60 = vt 0x55BEC90 + 0xF8, .?AVClientMinimapActorComponent) and 0x94FC47 (inside 0x94FB30 = vt 0x55BB768 + 0x10, .?AVCachedMapIconInfo_updateTask@...ClientGamePlayManager). The component lives at [actor+0x68]+0x160 (0x94FC40) and its actor is at comp+8 (0x9E8D8D). It is built in the actor component factory 0x8A9090 at 0x8A9A8C, component id 0x2C. Arguments are read as [rbp+0x800..0x818]: rbp = entry rsp - 0x7D8. decided is set at 0x9E90AA and 0x9E9FDB. removed is set at 0x9E9FEE, together with the protected removal call 0x3D2460 on [[0x6D69190]+0x80]+0x628. relation comes from 0x2215750 (written at 0x9E8DA3). 0x9EA6F0 applies the result.
+- [high] The texture indexes come from UIMapTextureInfoManager, reached as R64(R64(R64(R64(base+0x6D69528 on the client, 0x6D69530 on the server))+8)+0x270). Its well-known slots are: +0x100 Actor_Character, +0x104 Actor_Party_Default, +0x106 Actor_Player_Other, +0x108 Actor_Neutral, +0x10A/+0x10C/+0x10E Actor_Enemy/_Elite/_Aggro, +0x110 Actor_Npc_Witness, +0x112 Actor_Enemy_Boss, +0x114 Actor_Enemy_Police, +0x126 Actor_Focus, +0x14E Faction_OperationCharacterActor, +0xFC/+0xFE Actor_DeadBody_Lootable/_Sub.
+    The chain is read at 0x9E8D68..0x9E8D81 and 0x9EACD1..0x9EACEB. The manager's vt is 0x59881A0 (.?AVUIMapTextureInfoManager). Its slot +0x40 = 0x23731D0 fills mgr+0xA0+2*i for i < 0x69 from the name table at 0x59882D0 (dumped: i=48 Actor_Character, 50 Actor_Party_Default, 67 Actor_Focus, 87 Faction_OperationCharacterActor ...). Every use matches its name: enemy fallback 0x9E8C05-0x9E8C17, neutral 0x9E8BE7, boss 0x9E97DB, witness 0x9E9842, police 0x9E9860, player arrow 0x9E9180, dead bodies 0x9E96C5/0x9E96E5. Same holder as the plugin's LOCAL_STRINGS chain (+0x1C0).
+- [high] Damiane and Oongka take the playable-character branch. Because _playerIndex != 0, they show their own characterinfo texture whenever they are a valid owned mercenary of the player's clan. Damiane: Actor_Player_Damian 0x13F7. Oongka: Actor_Player_Oongka 0x13F8. Otherwise they fall back to Actor_Character.
+    0x9E9191: CharacterInfo+0x104 != 0. 0x9E91EF: +0x1E6 != 0xFFFF. 0x9E9205..0x9E923F: owned-mercenary lookup 0x214E7A0 on [[owner+0x68]+0x110], record +0x28 != -1 and +0x20 != 0xFFFF. 0x9E926F: icon = +0x1E6, else 0x9E9285: mgr+0x100. Data (characterinfo.staticinfobody, vanilla): Damian 0x4 record at file 0x3384, playerIndex 2 at rec+0x12D, _uiMapTextureInfo f7 13 00 00 at rec+0x1FD (file 0x3581), displayType 00 at rec+0x201, _isMapIconAlwaysShow 0 at rec+0x16E, knowledge 0xD. Oongka 0x6 record at file 0x5613, playerIndex 3 at rec+0x130, f8 13 00 00 at rec+0x200 (file 0x5813), displayType 0, alwaysShow 0 at rec+0x171.
+- [high] Camp comrades have playerIndex 0, _uiMapTextureInfo key 0 (which resolves to 0xFFFF), displayType 0 and alwaysShow 0. Their _spawnActorType is 4 (Mercenary), the same as Damiane. For a mercenary actor the code goes to 0x9E99B1, which never reads +0x1E6. There the icon depends only on the mercenary state: state 1 shows Actor_Character, state 3 shows Faction_OperationCharacterActor, anything else shows no icon. The accompany list is not consulted.
+    Jump table 0x9EA07C, indexed by actor kind [[actor+0x88]+1]: 1 and 4 go to 0x9E99B1, 3 to 0x9E9754, 5 to 0x9E9BBF, 6 to 0x9E9B16, 7 to 0x9E9CE5, all others to 0x9E9FDB. Kind names (0x191640): 1 Player, 3 NonPlayerCharacter, 4 Mercenary, 5 Vehicle, 7 Gimmick. 0x9E99B1..0x9E9B11: checks 0x9EA0B0 and npcInfo flag 0x20, then the owned lookup 0x214E7A0, then 0x214D130(clan, rec+0x28). Result 3 gives mgr+0x14E (0x9E9AE7), 1 gives mgr+0x100 (0x9E9B05); not owned but friendly gives mgr+0x100. 0x214D130 returns 6 when there is no record; otherwise the first i in 0..5 with rec+0xE1+i != 0 (0x214D1C0..0x214D1D3, default 5), forced to 0 at 0x214D33E/0x214D470. rec+0xE2 is set together with +0xE0 by 0x2B93060 at 0x2B93147. 0x2B93060 is called from 0x2A30BB0, the server handler of packet 0xB83 TrocTrAddHyosiMercenaryReq; the client copies the flag at 0x9E427B and clears it at 0x9E41EB. Data: Max 0x280 (record file 0x1A0560E), Matilda 0xF4C70 (0x19F0F5A), Otto 0xF4DEF (0x1A54373), Wybert 0xF4DE6 (0x1A3718E), Astin 0x23E (0x19EB331). All have playerIndex 0, spawnActorType 4 (Damian/Oongka are also 4; Kliff 1), _uiMapTextureInfo 00 00 00 00 at rec+0x235/0x244/0x23F/0x247/0x241 (file 0x1A05843/0x19F119E/0x1A545B2/0x1A373D5/0x19EB572), displayType 0 at +4, alwaysShow 0 at rec+0x1A6/0x1B5/0x1B0/0x1B8/0x1B2, knowledge 0x7FFFFDE3/DEA/DC7/DD1/DEC. The uimaptextureinfo table has no key 0 (lowest key 0x1); reader 0x1520CC0 writes 0xFFFF for an unknown key (0x1520D48).
+- [medium] The actor kind comes from characterinfo _spawnActorType, so comrades, whether camp or summoned, are kind 4, not kind 3 as the earlier recruit review guessed.
+    _spawnActorType values across all records line up with the 0x191640 enum: Kliff 1, shops 3, 425 hireables 4, vehicles 5, pets 6, gimmicks 7. The server spawn request 0x2BAFF30 reads CharacterInfo+0x68 at 0x2BAFF68 and accepts only 4, 5 and 6 (the summon kinds). The reviewer's cited check at 0x2B47473 is a generic kind-3 NPC test. Not confirmed at runtime.
+- [medium] What the other fields mean. _mapIconDisplayType (+0x1E8): 1 means show only while the actor's AI is in a stage ([[actor+0x68]+0xB0]+0x2F4 != -1, reset to -1 at 0x1F554FE when it leaves the stage at ai+0x2E0); 0 means no restriction. No enum names exist in the exe, and every characterinfo record has 0. _isMapIconAlwaysShow (+0x163) matters only on the kind-3 NPC branch: it shows +0x1E6 even before the character's knowledge entry is learned. In other words, a texture set in data only works for kind-3 NPCs, and then it is always on, not tied to the party.
+    0x9E9705..0x9E9720 (displayType == 1 and ai+0x2F4 == -1 goes to the hide path 0x9E9FDB). Kind-3 branch 0x9E9949..0x9E99A7: knowledge +0x1EA learned (0x213EFA0 on [[owner+0x68]+0x150]), or +0x163 == 1, or no knowledge entry, gives icon = +0x1E6. Other +0x1E6 readers are the UI tooltips 0xCF4F04/0xF05C0B/0xF63228 (texinfo+0x22 path); the actor-map uses are all inside 0x9E8D10. Scan of all 6992 records: displayType always 0.
+- [medium] Recommended plugin change: a post-call MinHook on 0x9E8D10 (client side, plain code) that gives recruited comrades the Actor_Party_Default icon. It only acts when the game itself chose no icon and did not hide or remove it, so it covers camp actors and summoned copies, and stops by itself on Dismiss.
+    Prologue 48895C2420 4C89442418 4889542410 48894C2408 55 56 57 4154 4155 4156 4157 488DAC2460F8FFFF 4881ECA0080000 has exactly 1 hit in the code section. Check the call site { 0x9E8A6B -> 0x9E8D10 }. Detour (place it after TrackedSlot in game.cpp): call the original; then if (*tex==0xFFFF && !*decided && !*removed): actor=R64(comp+8); slot=TrackedSlot(R32(actor+0x60)); if 0<=slot<MAX_COMRADES: m = R64(R64(R64(R64(base+(tls&&R8(tls+0x1EC)?0x6D69530:0x6D69528)))+8)+0x270); require R64(m)==base+0x59881A0; t=R16(m+0x104) (or +0x100 for Actor_Character); if t!=0xFFFF { *tex=t; *decided=1; }. Wrap it in __try; it may run on worker threads (from 0x94FB30), so read only the volatile g_tracked, no locks. Respecting decided keeps dead bodies (cc+0x273 branch) and the game's own hides. Actor_Party_Default is also what the game shows for a hireable party member who is not owned (0x9E9469), and story Greymanes such as Macduff 0x190, Yann 0x192 and Nairah 0x19C carry it as their texture.
+- [medium] The icons will not be hidden by the world-map legend filters.
+    uifiltergroupinfo 0xF424F 'Group_Invisible' lists Actor_Focus, Actor_Player_Damian, Actor_Player_Oongka, Actor_Character, Actor_Npc_Default, Actor_Party_Default, Actor_Player_Other, Actor_Mercenary_Worker, Actor_Neutral, Actor_Npc_Mercenary. Texture keys: Actor_Party_Default 0x13A0, Actor_Character 0x13B1. 0x9EACF2..0x9EAD11 attaches a label from the protected 0x1436D70 when the texture equals mgr+0x100.
+ACTIONS:
+ - Read the characterinfo field walk (gca\wf4\charinfo_reader.txt): _uiMapTextureInfo +0x1E6 is a u32 key in the file that becomes a u16 index through reader 0x1520CC0 and manager 0x6D6E418; _mapIconDisplayType +0x1E8 (u8); _isMapIconAlwaysShow +0x163.
+ - Pulled the map-related strings and RTTI from the exe; found ClientMinimapActorComponent (vt 0x55BEC90), its factory 0x8A9090, and the CachedMapIconInfo task (vt 0x55BB768).
+ - Scanned the code for +0x1E6/+0x1E8/+0x163 accesses and found the single texture-selection function 0x9E8D10. Disassembled it fully, including the jump tables at 0x9EA07C, 0x9EA044 and 0x9EA060, plus 0x9E89C0, 0x9E7C60, 0x94FB30, 0x9EA0B0, 0x9EA140, 0x214D130 and the start of 0x9EA6F0.
+ - Decoded UIMapTextureInfoManager's well-known slot table (0x59882D0 name table, filled by 0x23731D0) and cross-checked it against every use in 0x9E8D10.
+ - Traced the mercenary state flags rec+0xE1..+0xE6: +0xE2 is the Follow-into-Combat flag (writers 0x2B93147 on the server, 0x9E427B/0x9E41EB on the client; packet 0xB83 handler 0x2A30BB0).
+ - Parsed characterinfo (via tables.py) and compared map texture, display type, always-show, knowledge, playerIndex and spawnActorType for Damiane, Oongka, Max, Matilda, Otto, Wybert and Astin, with record and file offsets. Also scanned all records (display type always 0) and the uimaptextureinfo / uifiltergroupinfo tables.
+ - Checked that the 0x9E8D10 prologue is unique and read game.cpp's hook setup and g_tracked/TrackedSlot to fit the proposed detour. No project files were edited.
+ - Scratch scripts and dumps are in <scratchpad>\gca\wf8\map\: f9E8D10.txt, l9E99B1.txt, f9E7C60.txt, f9EA6F0.txt, f8A9090.txt, scan_maptex.py, maptex.pkl, umt.pkl, ci.pkl, dispscan.py, callers.py, strs_map.txt.
+OPEN:
+ - Runtime check: is the comrade actor's kind R8(R64(actor+0x88)+1) really 4 for both the camp actor (spawn 0xC) and the summoned copy (0xE)? If a camp actor is kind 3, the kind-3 branch 0x9E9754 does use +0x1E6, so a data edit would show an always-on icon at the camp. The hook works for either kind.
+ - Does ClientMinimapActorComponent's update run the texture path for comrade actors? 0x9E7DFD requires (comp+0x34 & 6), and those bits are set by protected or unread code. It is assumed yes because Damiane (also spawnActorType 4) shows; a first test of the hook settles it.
+ - Which icon does the user prefer? Actor_Party_Default (mgr+0x104, the party-member icon, no name) or Actor_Character (mgr+0x100, what the game shows for a Follow-into-Combat comrade, labelled by 0x9EA6F0 through the protected 0x1436D70, probably his name). There is no Greymane-specific actor texture in uimaptextureinfo.
+ - What does record +0xE1 mean? If it is set, 0x214D130 returns state 0 even for a Follow-into-Combat comrade. This only matters for the rejected alternative of making recruited comrades Follow-into-Combat (packet 0xB83, handler 0x2A30BB0, 0x2B93060) to get the game's own Actor_Character icon. That route also changes gameplay through clan+0xA8, so it is not recommended.
+ - Not recommended: a data-only change of _playerIndex (comrade file offsets rec+0x165/0x174/0x16F/0x177/0x171, u16 0) would send comrades down Damiane's branch (+0x1E6 icon whenever hired, even at camp). playerIndex drives playable-character switching (Damiane 2, Oongka 3), so its side effects are unknown.
+===== verify:map
+HOLDS 0x9E8D10 is the only map-texture selector, with the stated signature; its single caller is 0x9E89C0, which is called by the ClientMinimapActorComponen
+    Confirmed. A call/rip/abs scan finds only E8 at 0x9E8A6B calling 0x9E8D10. The prologue at 0x9E8D2F/0x9E8D37 gives rbp = entry-0x7D8, so [rbp+0x7E0/7E8/7F0/800/808/810/818] = rcx/rdx/r8/5th..8th args. Caller 0x9E89C0 passes tex = its own rdx (r9=r15 at 0x9E8A5D), decided = local [rbp-0x30] set to 0 at 0x9E8A31, and relation = local preset to 5 at 0x9E8A39. RTTI checks out: 0x55BEC90 is ClientMinimapActorComponent (slot +0xF8 = 0x9E7C60) and 0x55BB768 is CachedMapIconInfo_updateTask (slot +0x10 = 0x94FB30). Correction: 0x9E89C0 has a THIRD caller, in protected .xtls code at 0x9C61E0B, which then calls 0x9EA6F0 at 0x9C61E4A and writes comp+0x38..0x40. The claim misses this caller. It does not affect a hook on 0x9E8D10, but it is another thread context to expect. Note: 0x9E7C60 only reaches the call (0x9E7E3A) when comp+0x34 & 6 (0x9E7DFD) and [0x6CC1A98] == 0. Otherwise it uses the cached comp+0x38.. values.
+HOLDS UIMapTextureInfoManager chain and its well-known slots (+0x100 Actor_Character, +0x104 Actor_Party_Default, ... +0x14E Faction_OperationCharacterActor
+    Confirmed. The chain is at 0x9E8D68..0x9E8D81. RTTI of 0x59881A0 is .?AVUIMapTextureInfoManager@pa@@ and its vt+0x40 = 0x23731D0, which loops over the name table [0x59882D0 + 8*i] into mgr+0xA0+2*i (0x237320C/0x237322A) and writes 0xFFFF for an unknown name (0x237329D). Decoded names: i46 0xFC DeadBody_Lootable, 47 0xFE _Sub, 48 0x100 Actor_Character, 50 0x104 Actor_Party_Default, 51 0x106 Player_Other, 52 0x108 Neutral, 53-55 0x10A-0x10E Enemy/Elite/Aggro, 56 0x110 Npc_Witness, 57 0x112 Enemy_Boss, 58 0x114 Enemy_Police, 67 0x126 Actor_Focus, 87 0x14E Faction_OperationCharacterActor. Each one matches its use (0x9E9180, 0x9E96C5/0x9E96E5, 0x9E97DB, 0x9E9842, 0x9E9860, 0x9E8C05..0x9E8C17).
+HOLDS Damiane/Oongka take the playable-character branch and show their own characterinfo texture 0x13F7/0x13F8 when they are an owned mercenary of the playe
+    Confirmed. 0x9E9199 tests _playerIndex (+0x104, field walk 0x14F0962) != 0. 0x9E91EF tests +0x1E6 != 0xFFFF. Then either r14 == r13 (the actor is the clan owner) or the owned lookup 0x214E7A0 on [[owner+0x68]+0x110] must give rec+0x28 != -1 and rec+0x20 != 0xFFFF. If so the icon is +0x1E6 (0x9E926F), else mgr+0x100 (0x9E9285). Data bytes check out: Damian 0x4 has +0x12D = 0200, +0x1FD = f7130000, +0x201 = 00, +0x16E = 00. Oongka 0x6 has +0x130 = 0300, +0x200 = f8130000, +0x204 = 00, +0x171 = 00. uimaptextureinfo 0x13F7 = Actor_Player_Damian and 0x13F8 = Actor_Player_Oongka. The claim leaves out one sub-path: if the FOCUS actor's cc+0x340 != 0 or the protected 0x96AAF0 returns true (0x9E91C1/0x9E91D5), the icon is the component's cached comp+0x18 (0x9E92B5).
+REFUTED Camp comrades: playerIndex 0, texture key 0 (-> 0xFFFF), displayType 0, alwaysShow 0, kind 4; at 0x9E99B1 the icon depends only on the mercenary state
+    The data and the 0x9E99B1 decode are right. Max/Matilda/Otto/Wybert/Astin have 00000000 at the stated +0x235/+0x244/+0x23F/+0x247/+0x241, then 00, then knowledge 0x7FFFFDxx, and alwaysShow 00. uimaptextureinfo has no key 0 (min key 0x1). The jump table 0x9EA07C matches (1,4 -> 0x9E99B1; 3 -> 0x9E9754; 5 -> 0x9E9BBF; 6 -> 0x9E9B16; 7 -> 0x9E9CE5; 0,2,8,9 -> 0x9E9FDB). 0x214D130 returns 6 with no record, otherwise the first i<6 with rec+0xE1+i != 0 (default 5), forced to 0 at 0x214D33E/0x214D470. Two statements are wrong. (1) 'Depends only on the mercenary state' is overstated: 0x9E99B1 first exits with no icon when 0x9EA0B0(comp) is true (npcInfo(+0x6C) flag bit 1, or the runtime global [0x6CF7144] == 0) and when npcInfo flag 0x20 is set (0x9E9A29..0x9E9A4F). A non-hostile (relation != 0) actor that is NOT owned gets Actor_Character (0x9E9AB1..0x9E9B05). (2) A party list IS consulted, before the kind switch. At 0x9E92CD, 0x9EA140 checks whether the actor's party [[actor+0x68]+0x108] (members via 0x21D8980, the same party getter the earlier research found at .xtls 0x106CCB82) contains the local player. If it does, and _mercenaryInfo (+0xBE) != 0xFFFF (0x9E9373), and the actor is NOT an owned mercenary (0x9E93AD..0x9E93C1), the game itself shows Actor_Party_Default (0x9E9469). Owned comrades fall through to 0x9E93D4, so the conclusion still fits owned comrades. Their actual runtime state value was not shown.
+REFUTED The actor kind comes from characterinfo _spawnActorType, so camp and summoned comrades are kind 4
+    Not shown. 0x2BAFF68 reads CharacterInfo+0x68 and accepts 4/5/6 for a summon request, but it does not set the actor kind byte [[actor+0x88]+1]. No writer of that byte was traced. Camp actors are spawned by NPCSchedule (cc+0x2D0 = 0xC), and that path could create a different actor kind. The fact that the enum values line up is suggestive, not proof. It does not matter for the hook proposal: with +0x1E6 = 0xFFFF and knowledge not learned / alwaysShow 0, the kind-3 path (0x9E9754 -> 0x9E9949..0x9E9992) also ends with no icon.
+REFUTED _mapIconDisplayType 1 = only while in an AI stage; _isMapIconAlwaysShow matters only on the kind-3 branch; so a data texture only works for kind-3 NPC
+    The mechanics are confirmed. 0x9E9705..0x9E9720 hides when displayType == 1 and [[actor+0x68]+0xB0]+0x2F4 == -1, and 0x1F554FE writes -1 to +0x2F4 next to +0x2E0. +0x163 is read only at 0x9E998B, on the path through 0x9E9949 (kind 3, or kind > 9), after the knowledge test 0x213EFA0 at 0x9E997A. The 'in other words' conclusion is wrong. +0x1E6 is also shown by the playable-character branch (0x9E926F, playerIndex != 0 and owned, which is how Damiane gets hers) and by the dead-body branch (0x9E9436 -> 0x9E9998 when texinfo(+0x1E6)+0xBB != 0). For a comrade (playerIndex 0, kind 4) a data texture is still ignored, so the practical point stands. The scan claiming displayType is always 0 was not re-run.
+REFUTED Post-call MinHook on 0x9E8D10 that sets Actor_Party_Default for tracked comrades when *tex == 0xFFFF && !decided && !removed; covers camp and summoned
+    The mechanics are sound. 0x9E8D10 is in plain code, not .xtls. The 44-byte prologue has exactly one hit in the code section. tex/decided/removed point to caller stack locals that the callers initialise (0x9E7E07..0x9E7E14 r14w = 0xFFFF, 0x94FC15..0x94FC23). TrackedSlot only reads volatile g_tracked (game.cpp 230/2249), and restricting it to slot < MAX_COMRADES leaves out the departed entries (indices 4..7, TrackDeparted 1097). Actor +0x60 is the key that client code compares against clan rec+0x50 (0x9E9B53), the same key g_comrades stores. It touches nothing in the save and costs little per call if *tex is tested first. What is NOT shown is that 0x9E8D10 ever runs for a comrade. The per-frame update calls it only when comp+0x34 & 6 (0x9E7DFD). Those bits are written inside the result applier 0x9EA6F0 (0x9EAC01, 0x9EAF77). Otherwise it runs through the cached task's key list ([task+0x90], count +0xA0, filled elsewhere) or the .xtls caller, and who is on those lists is unknown. So 'covers camp actors and summoned copies' is unproven. Side effects found: (a) dead comrade: the dead-body path can return with tex 0xFFFF and decided 0 (0x9E9575 jne 0x9EA027), so the corpse would get the party icon; add R8(R64(R64(actor+0x68)+0x20)+0x273) == 0. (b) It overrides the game's deliberate no-icon exits at 0x9E99C2 (0x9EA0B0 / [0x6CF7144]) and 0x9E9A4F (npcInfo flag 0x20), which may be hide states such as cutscenes. (c) It does not stop on Dismiss by itself: it stops because Release -> SetPhase(PHASE_FREE) -> Track() clears g_tracked (1047/1049). The icon also stays during PHASE_STANDBY/PHASE_LOST.
+HOLDS The icons will not be hidden by the world-map legend filters
+    uifiltergroupinfo 0xF424F 'Group_Invisible' contains 0x13F7 (Actor_Player_Damian) at +77, 0x13B1 (Actor_Character) at +950 and 0x13A0 (Actor_Party_Default) at +968. Damiane's texture is in the same group and the user does see her icon, so being in this group does not hide an icon. What the group actually means was not decoded, so this is an inference (medium). The label at 0x9EACF2..0x9EAD11 attaches only for mgr+0x100, not for +0x104.
+ACTION REVIEW: Safe in principle, but build it as a logging test first.
+
+Safety checks:
+- **Protected code:** 0x9E8D10 is plain code, not .xtls. Its prologue is unique and MinHook can relocate it.
+- **Writes:** the detour writes only to the caller's stack locals (tex, decided). It calls no game function and writes nothing that could reach the save.
+- **Threads:** it can be called from the minimap update, from the CachedMapIconInfo interleaving task (possibly a worker thread) and from a protected caller at .xtls 0x9C61E0B that the claims did not list. So keep it lock-free: read only g_tracked, wrap the pointer chain in __try, and never Log on every call.
+- **Per-frame cost:** it runs once per actor per update. Test *tex == 0xFFFF && !*decided && !*removed before TrackedSlot, which loops over 8 entries; that is cheap.
+- **TLS:** read the server/client flag exactly as game.cpp does (gs:[0x58] -> [0] + 0x1EC). Compare R64(m) with base+0x59881A0.
+
+Fixes before shipping:
+1. Skip dead actors (cc+0x273 != 0). The dead-body path at 0x9E9575 can leave tex 0xFFFF with decided 0, which would put the party icon on a corpse.
+2. Decide whether the icon should stay during PHASE_STANDBY and PHASE_LOST. g_tracked keeps every phase except PHASE_FREE.
+3. Accept that it overrides the game's own no-icon exits at 0x9E99C2 and 0x9E9A4F. Or, more conservatively, act only when the game reached the end of the mercenary branch.
+
+Main open risk: nothing shows the selector is ever re-run for an actor that never had an icon. The per-frame update calls it only when comp+0x34 & 6, and those bits are written by the result applier 0x9EA6F0 itself. Otherwise it depends on the cached task's key list or the .xtls caller, and their membership is unknown. So the first build should log once per tracked actor key when the detour sees it, with its kind, the original tex, decided, removed and comp+0x34. If it never fires, hooking 0x9E8D10 alone will not work.
+
+Note for later: for a party member that is not an owned mercenary of the clan, the game already shows Actor_Party_Default itself (0x9E92CA -> 0x9E9469). Comrades are owned (AccompanyMercenary requires it), so they bypass that path.
+
+No project files were edited. Scratch files are in <scratchpad>\gca\wf8\map_skeptic\ (f.txt, jt.py, calls.py).

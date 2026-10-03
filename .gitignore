@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+build/
+dist/
+asi/bin/
+asi/obj/
+asi/x64/
+*.log

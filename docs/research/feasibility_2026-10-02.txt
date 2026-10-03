@@ -1,0 +1,200 @@
+FEASIBILITY REPORT: "Greymane Recruit" mod (recruit named Greymanes, have them follow you and fight)
+Static research only. The game was not run, and nothing in the game folder or the DMM folder was changed.
+
+SHORT ANSWER
+This looks feasible, and the most realistic first version is data-only. The game already has a full companion system (the "mercenary clan"). It already has the E-prompts, with English text: Recruit, Follow, Standby, Disband, Follow into Combat. It also has two working ways for an ally to fight with you:
+- Companions: Damiane and Oongka are called from the Comrade Quick Slot, follow you and fight.
+- Combat-support comrades: hired camp Greymanes come when you shoot the Whistling Arrow.
+
+Hiring a character is a data reward: a drop set named "Mercenary(<character>)". An interaction can hand out a drop set when you use it. So "press E on Naira, she joins" can be built from existing parts.
+
+Naira and Yann already have complete, unused companion records (built like Damiane and Oongka) that nothing in the game ever hires. Getting a world NPC itself to follow you everywhere, rather than a companion copy, probably needs a small ASI as well.
+
+1. NAMED GREYMANES FOUND
+Source: characterinfo._factionInfo = Faction_Graymane (0xF4240). This covers 173 records, named and generic. Each record was then checked for its mercenary type, hire drop set and mercenary prompts. Scripts are in the scratchpad: grey_census.py and grey_merc.py.
+
+a) Story / main-cast Greymanes. None of these can be hired today: mercenary type 0xFF, no hire drop set, no comrade prompts.
+- Naira: NHW_Unique_Nairah_DualSword_412 (0x19C); variant _444 (0x1BC)
+- Yann: NHM_Unique_Yann_DualDagger_402 (0x192); variants _443 (0x1BB) and _621 (0x26D)
+- Duane: NHM_Unique_Dwayne_TwoHandSword_405 (0x195)
+- Shane: NHM_Unique_Shane_OneHandBow_410 (0x19A) and _OneHandBow_1 (0xF4A48)
+- Jian: NHM_Unique_Ziane_TwoHandSword_411 (0x19B); Young Jian _401 (0x191)
+- Roy: NHM_Greyfur_Roy (0xF51D4)
+- Torian: NHM_Unique_sculpture_merchant_1 (0xF45F8)
+- Partial cases:
+  - Giles (0xF5107) and Marius NHM_Unique_Marius_1 (0xF478D) already have the Follow into Combat prompts but no mercenary type and no drop set.
+  - Marius NHM_Unique_Marius_468 (0x1D4) is Mercenary_Shop with drop set 0xF43ED.
+- The NPC versions of the playable trio, already covered by the trio itself: Kliff (Macduff_400, 0x190), Damiane (404, 0x194), Oongka (406 / 445).
+- Greymane-adjacent but not this faction: Bram, Richard, Gunnar (GreyFur 0xF4A60 / 61 / 62). Richard is the one who hires domestic animals through set_hireMercenary.
+
+b) Unused companion records, type Mercenary_Main (0x40), the same type as Kliff (1), Damian (4) and Oongka (6):
+- "Nairah" 0xF52CC (1004236, English "Naira")
+- "Yann" 0xF5235 (1004085)
+- "Yahn" 0x2 (an older Yann)
+- "Witch" 0xF52CF
+They have the 600 s call cooldown, the "player" ally group, the Follow / Standby / Heal prompts, the "Comrade Found" hire text and player-format assets (1_pc cd_phw_nairah, cd_phm_yann, customization .paccd, portraits). No drop set and no condition anywhere hires them.
+
+c) Camp comrades that can already be hired. Each has a Mercenary(...) drop set and the Follow into Combat prompts.
+- Melee (24): Aldric, Andrew, Ashton, Balder, Brant, Brennan, Devan, Falstaff, Fred, Gerald, Joan, Joseph, Kenneth, Lars, Laurent, Lucius, Luke, Morrow, Pierce, Ryan, Silvan, Terry, Vernon, Wybert.
+- Range (14): Anders, Arnold, Colton, Duncan, Evelyn, Fritz, Gilbert, Luther, Matilda, Max, Niall, Otto, Ronald, Xavier.
+- Shop (16): Alec, Ben, Brice, Carl, Connor, Conrad, Diederik, Ed, Eric, Kamu, Oliver, Ronnie, Ross, Tranan, Wynstan, Marius_468.
+- Worker: Grey-0.
+- Precedent: Ryan (409, 0x199) and Andrew (647, 0x287) are story characters (Andrew is a Party member in the mjordin_boss and crowman stages). They are also hireable Melee comrades, with drop sets 0xF4409 and 0xF4415. So the game already tolerates a story NPC record that is also a comrade.
+
+2. WHAT THE GAME ALREADY HAS THAT CAN BE REUSED
+
+2.1 The companion engine
+- The mercenary clan components: Client / Common / ServerMercenaryClanActorComponent, reached at [[actor+0x68]+0x110].
+- Accompany types: 0 None, 1 Wait, 2 FollowOffensive, 3 FollowDefensive, 4 Follow (parser at 0x22A4C20).
+- Server-side code is plain x64 (not protected):
+  - accompany-type setter 0x21523A0
+  - AIFunction_SetAccompanyType path 0x2AC9270
+  - accompany registration 0x2150930 via the stage processor slot 0x120 (0x293DDE0). It only checks that the character is an owned, spawned mercenary.
+  - HireMercenary via processor slot 0x200 (0x293AEB0)
+- Some client-side pieces are protected .xtls stubs: 0x214E7A0 and 0x9E4840.
+
+2.2 Two existing "helps you fight" modes
+- Main companions (Damiane and Oongka): called from the Comrade Quick Slot, they follow, fight and teleport to their owner.
+  - quickslotinfo 0x4242 "Character" (DpadU) has 4 Mercenary_Main slots.
+  - Mercenary_Main is also the playable-character type (is_playable, is_main_mercenary_info).
+- Combat support ("Hyosi"): hired Melee and Range comrades marked "Follow into Combat" come when you shoot the Whistling Arrow.
+  - Item Hyosi_Arrow 0xC35B: "A signal arrow used to call for allied support".
+  - There is a cap and a cooldown ("Combat support comrade limit exceeded.").
+  - It is unlocked by the progression variable GameContentOpen_Hyosi 0xF4264.
+  - Only mercenarygroupinfo Mercenary_Combat 0x48 has is_hyosi_usable=1.
+
+2.3 The E-prompts
+- The prompts on an NPC come from CharacterInfo.interaction_info_list (u32 count, then interactioninfo keys) followed by interaction_distance.
+- Existing keys:
+  - Npc_Employ "Recruit" 0xF4292
+  - Npc_Order_Follow "Follow" 0xF4251
+  - Npc_Order_Wait "Standby" 0xF4253
+  - Npc_Order_Disband "Disband" 0xF425B
+  - Npc_Order_Follow_Defensive 0xF4315
+  - Npc_Hyosi_Add "Follow into Combat" 0xF428F
+  - Npc_Hyosi_Remove 0xF4290
+  - Mercenary_Heal 0xF4254
+- Follow and Standby are gated by condition 0x197, CheckAccompanyType. Follow shows when the type is 1 or 3; Standby shows when it is 2 or 3. So they only appear on a companion that is already accompanying you.
+- How a prompt reaches the AI: each mercenary interaction's tail hash appears in aiscript/bin__/aichart.pai. So an interaction fires an AI event on the target, and the target's AI chart reacts.
+  - Follow f5bfee82, Standby eebe079c, Disband 8ec9e12c and Follow(Defensive) 931e008b appear 34 times each.
+  - Recruit b87ec524 and Hyosi_Remove 52a0e1b8 appear 2 times each, at neighbouring offsets: 0x313506 / 0x312B1F and 0x333BF3 / 0x3331FF. That means the same chart handles both, twice (probably the camp-comrade chart).
+  - Heal appears 0 times.
+- There is no AIFunction for hiring: only FireMercenary, SetHyosi, SetAccompanyType and Party*. So "Recruit" may do nothing on an NPC whose AI chart lacks that handler.
+
+2.4 Hiring is a drop set
+- 65 drop sets are named "Mercenary(<string key>)". Their layout is simple: name, entry "01 <charKey u32>" (at +44 in Mercenary(Damian) 0xF7B1A, +68 in Ryan's 0xF4409), "ff ff <charKey u32>" (at +103 / +127), then the name again.
+- So cloning one for a new character is just swapping the key and the name.
+- Vanilla grants the camp ones through mission rewards (Graymane_Scout_Group_*).
+
+2.5 Interactions can grant drop sets
+- Npc_Dialog1 (0xAC) and Npc_Dialog2 (0xAD) hold DropSet_Friendly_Talk (0x90F562) at record +239; Npc_Shop_Quest_120 (0xF42CF) holds it at +257. This is very likely InteractionInfo._rewardDropSetInfo (an exe field name).
+- Other paths the game supports for handing out a drop set:
+  - CharacterInfo.character_friendly_item_data_list, with friendly_item_reward_drop_set_info_list (gift an item; DMM names this field)
+  - UITalkTreeInfo result_data_list (TalkTreeResultData._dropSetInfo)
+  - StageInfo reward_drop_set_info_list
+- interaction_name is a LocalizableString: 06 60 00 00 00 <key u32> + decimal text. Pointing a cloned record's name at Npc_Employ's id (4295319483318368) shows "Recruit".
+
+2.6 Fighting on your side
+- CharacterInfo has two flag blocks, _characterInfoOverridableFlags_Origin and _Mercenary. The _Mercenary block is zero even on working comrades, so the engine probably sets the side when a character is hired.
+- Stages use the tag set_playerAlly(), which applies skill Active_PlayerAlly 0x11554.
+
+2.7 Sequencer tools (heavier option)
+- Player.set_hireMercenary(actor, True, False, <Type>) in cd_seq_basecamp_domestic
+- Player.set_accompanyMercenary(...) in cd_seq_quest_bloodthrone_0100_dlc
+- the Party event with OnSequencer_Party_FollowLeader
+- the shop-style button menu cd_seq_funcnpc_mercenary (Ross)
+
+2.8 Restrictions
+- stageinfo: allow_accompany, logout / hide_mercenary_group_info_list
+- regioninfo: _isAccompanyAllowed
+- DMM's "Companions Everywhere" preset already lifts the story lockout (16 stageinfo records).
+
+3. APPROACHES
+
+APPROACH A: Data-only "true companion" for Naira and Yann (DMM v3 JSON)
+What you get: E on story Naira (0x19C) shows "Recruit". Using it hires the unused companion record Nairah 0xF52CC as a Mercenary_Main companion. You can then call her from the Comrade Quick Slot like Damiane: she follows, fights, has Follow / Standby / Heal, and you dismiss her through the quick slot or Standby. Yann works the same way with 0xF5235.
+
+Edits:
+1. dropsetinfo: a new record "Mercenary(Nairah)", a copy of 0xF7B1A with charKey 4 changed to 0xF52CC at +44 and +103, and both names replaced.
+2. interactioninfo: a new record copied from Npc_Dialog1 0xAC. Change the u32 at +239 to the new drop set and the name to the Recruit text. Use a free key (the current max is 0xF4391).
+3. characterinfo 412: add the new key with list_union on interaction_info_list.
+
+Known:
+- Both records are complete and identical in build to Damian (cooldown, interactions, ally "player", faction).
+- The drop-set layout is trivial.
+- Interactions carry reward drop sets in vanilla.
+
+Unknown:
+- Whether the unused records have working AI, skills and gear.
+- Whether hiring a 4th or 5th Main overflows the 4-slot quick slot.
+- Whether Main also makes her a switchable playable character (is_playable). This could be a bonus or a crash.
+- Whether DMM's new_record works on dropsetinfo and interactioninfo; the interaction tail is rest_b64.
+- Whether the reward field really is _rewardDropSetInfo.
+
+Risks:
+- Two Nairas at once: the camp story NPC plus the companion.
+- Story stages that dismiss companions (use "Companions Everywhere").
+- Save data refers to vanilla records, so removing the mod should be safe-ish (untested).
+
+First experiment: use a test save. Build the three edits for Naira only, then:
+- Talk to Naira at camp and check that "Recruit" shows.
+- Press it and look for a "Comrade Found" message.
+- Check the Comrade Quick Slot and summon her.
+- Check the Follow / Standby prompts and a fight.
+- Save, reload and check again.
+- Check DMM's mount log to confirm no edit was skipped.
+If the trigger fails, run a quick test build that puts the new drop-set key into Npc_Dialog1 itself, so that talking to any NPC hires her. That separates "does the hire work" from "does my interaction work".
+
+APPROACH B: Data-only "comrade" for all other named Greymanes (DMM v3 JSON)
+What you get: Duane, Shane, Jian, Roy, Giles, Marius_1, Torian and the others become hired camp comrades, Melee 0x46 or Range 0x47 (Shane is a bow user). They then get "Follow into Combat" and come to fight when you shoot the Whistling Arrow, exactly like Ryan and Andrew. This is "helps us fight", but not a constant follow.
+
+Edits per character:
+1. characterinfo: change the mercenary-type byte (Naira 412 at +0x120, 0xFF) to 0x46 or 0x47. DMM probably calls it f37 (unconfirmed). Optionally fill the hire-message LocString the way Ryan's is. Possibly also change flag index 38 (+0x18C on Naira) from 1 to 0, matching every hireable human comrade (its meaning is unverified; maybe _isHirable).
+2. characterinfo: add 0xF428F / 0xF4290 to interaction_info_list.
+3. dropsetinfo: a new record cloned from 0xF4409, with 0x199 swapped at +68 and +127.
+4. Trigger: the same cloned Recruit interaction as in A.
+
+Known: the exact working pattern of 38 vanilla comrades, plus the story precedent of Ryan and Andrew.
+
+Unknown:
+- Whether the hired NPC then shows up in Ross's "Manage Comrades" menu and the combat-support list.
+- Whether story-only AI charts answer the combat-support call.
+- What happens to the save if the mod is removed while the character is hired (the type reverts to 0xFF).
+
+Risks: quest stages that spawn these records as control actors (the Andrew precedent lowers this risk), the combat-support cap, and DMM field naming.
+
+First experiment: do it for Duane (405) only, in the same test build as A. Recruit him, check Ross's menu, use Follow into Combat, then shoot the Whistling Arrow in a fight.
+
+APPROACH C: Mixed. Approach A or B data, plus a small ASI so the world NPC itself follows you
+What you get: the NPC you talk to, not a copy, starts following you, fights, and answers Follow / Standby / Disband. This is closest to the request, and it works for every named Greymane.
+
+How:
+- Hire through B's data path.
+- Then the ASI calls the server-side accompany path, the same one quests use: processor slot 0x120, 0x293DDE0, then 0x2150930(clan=[[player+0x68]+0x110], leader, {charKey}). That function only requires the NPC to be an owned, spawned mercenary.
+- After that, Follow / Standby on the NPC switch the accompany type through the existing AI path (0x21523A0, with an Ack via 0x297EF40). Add 0xF4251 / 0xF4253 / 0xF425B to their lists.
+- Optionally, apply skill 0x11554 Active_PlayerAlly.
+
+Known: the function addresses, the entry layout (clan+0xB8, 24-byte entries: u16 index, u32 actor key, u8 accompany type), and that the server side is unprotected.
+
+Unknown:
+- How to catch the moment the player uses the E-prompt, and how to get the target actor.
+- Whether calling the server function also keeps the client in sync.
+- Whether the story NPC's AI chart contains the follow-leader / help-leader branches. The Follow event hash appears in 34 places, but which charts those are is unknown.
+- Whether the follow state survives save and reload.
+
+Risks: RVAs change on game updates (needs signature scans), antivirus false alarms, and more runtime RE work.
+
+First experiment: after B works for Duane, add a hotkey in the ASI that calls the accompany path for him. Then check that he follows, that Follow / Standby appear, and that he fights.
+
+Considered and deferred: a sequencer stage per NPC, with a funcnpc-style button menu calling set_hireMercenary and set_accompanyMercenary. It needs new .paseqc and compiled .pastage files; the .pastage is only partly decoded and the templates are not in the archives.
+
+4. RECOMMENDATION
+1. Make one data-only test build: A for Naira, B for Duane, and as a control a plain list_union of Npc_Employ (0xF4292) on Naira 412, to see whether vanilla's own "Recruit" handler does anything. That one evening answers the key questions: does the hire drop set work, does the reward-interaction trigger work, are the unused companion records usable, and does DMM accept these edits.
+2. If A works, release v1 with Naira and Yann as full companions, plus every other named Greymane as a B comrade. That is all DMM JSON, with the same release style as Equip All Armor, and it should be recommended together with "Companions Everywhere".
+3. Move to the C ASI only if the user wants the actual camp NPC to follow everywhere, or if the unused companion records turn out broken.
+
+Scratchpad files used for this report (scratchpad):
+- grey_census.py
+- grey_merc.py
+- dsfind.py
+- st.py, ci.py, ilists.json and struct_fields.json from the earlier research

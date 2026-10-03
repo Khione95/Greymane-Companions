@@ -1,0 +1,45 @@
+Horses and map icon research, 2026-10-03 evening (static only; nothing run)
+
+WHY THE GAME'S OWN HORSE CALL CANNOT WORK FOR COMRADES
+- AI chart 0xA17A8F3E, OnRide_FocusActor container 0x207 is gated by AND(CheckMercenaryGroupKey#1, CheckMercenaryHired);
+  the call branch also needs HasOwnedMercenaryGroup (a Vehicle-group clan record whose +0x148 is her character index -
+  saved through SQL). MercenaryCallingVehiclePackage asks for action CALL_VEHICLE (188), which the comrades' upper
+  packages CD_NHM_Upper / CD_NHW_Upper lack.
+
+PLUGIN-ONLY PATH (what the Horses experiment does)
+- The player's mount: [[[actor+0x68]+0x48]+0x18]: +0x10 vehicle key (0 on foot), +0x14 seat (0 driver).
+  GetMountedVehicle 0x17EE200(actor, Scope*) reads the same.
+- Vehicle component vc = [[horse+0x68]+0x48]: +0x48 u32[16] rider per seat, +0x88 reserved riders, +0xC8 rider count,
+  +0xEB vehicle flag (0x27E1F3B), +0x21 reserved seat.
+- Horses: characterinfo +0x6E (vehicle type index) equal to Damiane's horse 0xF46D5's; mercenaryinfo 0x4E; AI chart
+  0x07758170. Saddle horses: Davrella 0x7B0B, 0x7F1D..0x7F21; Ayut 0x7E5C, 0x7F59..0x7F5D; Domestic 0x7AFA, 0x7EFA..0x7EFE.
+- Server actor snapshot 0x2A83CB0(mgr = **(base+0x6D69698), VecRef* out): held 0x20-byte refs {vt, actor +8, valid +0x10}
+  of every character actor (kinds 1, 3..9), takes the manager lock itself; release each with (*(vt))(&ref, 0) last to
+  first (as the sweep 0x2C37340 does).
+- Seating: client 0x5EE330(0, senderClientActor, riderClientActor, vehicleClientActor): vc vt+0x1A8 (seat 0, mode 2),
+  vt+0x1B0, then 0xC05630 sends TrocTrRideOnVehicleReq 0xA1D; the server handler 0x2A60650 -> 0x2C4B090 seats both
+  without checks. Sender must be a ClientActor ([[0x6D69190]+0x30]+0x50). Client actor lookup: [[base+0x6D694D8]+0x10]
+  (vt 0x55B62C8) vt+0x28 = 0x8AE1A0(mgr, Scope*, key), client thread.
+- Ride-off (server): vc vt+0x158 = 0x2C19370(vc, u32* err, const u32* rider, u32 p4, u8 p5, u8 p6) - broadcasts
+  TrocTrRideOffByServerAck 0xB7A. p4 meaning unverified (0, 1, 0 used).
+- Spawn (the dev spawn's steps 0x2C3F0D6..0x2C3F33D, without its permission check): field scope 0x17FA6C0, desc
+  0x278EA70(desc, 0, reason 0x0D Summon), position 0x2797080(desc, world float3, base+0x6A65908), desc+8 = character
+  index, desc+0x3C0 = spawner key, desc+0x40 = owner vt+0x160 for characterinfo +0x68 == 4, desc vt+0x20(desc, &err),
+  field vt+0x88 = 0x2AF9AE0(field, &err, Span{desc**,1}, NULL); the new actor is desc+0x18 (valid byte +0x20); free
+  with 0x278F260. Spawn types (enum 0x15BA3F0): 0xC NPCSchedule, 0xD Summon, 0xE SummonMercenary, 0x20
+  Summon_LinkedVehicle, 0x21 Cheat.
+- Logout: 0x2068340(actor, u8 out[0x20], type 0x2B, reason [base+0x6CF71D4] eErrNoLogoutVehicleDismountAll).
+- Save: no clan/SQL code is touched; that a Summon spawn is never saved is unverified (summon children log out with
+  their spawner, 0x28F26C0). Test: save while riding, reload, look for stray horses.
+- Unknown: whether a seated comrade's client-run AI follows on horseback (OnRide_Driver 0x60E294AD -> container 0x1B9
+  -> VehicleSyncIdlePackage). Alternative: the ride interactions Horse_Ride_NPC 401 / _Woman 402 / Horse_Ride_Mercenary
+  1000074 (unverified keys).
+
+MAP ICON
+- The selector 0x9E8D10's return value is unused; relation is overwritten at its start; the detour's tex = 0x0068
+  (Actor_Party_Default) is all the game needs. Cache mode is on ([0x6CC1A98] = 1): the CachedMapIconInfo task 0x94FB30
+  runs the selector and writes comp+0x38..+0x3D; the minimap update 0x9E7C60 applies the cache (0x9EA6F0) when
+  comp+0x34 & 6. The applier posts CreateMinimapActor (comp+0x18 != 0xFFFF afterwards); no distance / relation filter.
+- The world map uses the same component and events (minimapicon.thtml / worldmapicon.thtml).
+- If comp+0x18 becomes 0068 but nothing shows: try MapIconStyle = 1 (Actor_Character, with the name label - the icon
+  vanilla gives camp comrades in mercenary state 1). A follower 2 m away may be drawn under the player arrow.

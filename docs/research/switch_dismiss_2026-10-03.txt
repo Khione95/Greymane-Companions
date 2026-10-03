@@ -1,0 +1,381 @@
+===== research:switch
+SUMMARY: I could not pin the Kliff refusal on one check from static analysis alone. What the code does settle is that the plugin's own Kliff entry is not the problem. The switch never reads the actor key from that entry. It reads Kliff's actor straight from the owner: [owner+0x60] at 0x17ED0A5 on the server side of the check and 0x4FAAEB on the client. The owner does not change on a focus change; only user+0xD8 does. So the key can never go stale. The entry is also byte-for-byte what the vanilla quest stage 0x293DDE0 creates, and no switch check reads its type or its position in the list.
+
+**How a switch runs:**
+- The client UI first runs a shared yes/no check (0x17EC980, which calls 0x17ECB50 for the target).
+- The client then sends 0x8F0 StartChangeFocusActorReq {u32 target key, u8 force}. The server runs the same check again (0x294D5B0).
+- The client sends 0xA9A ChangeFocusActorReq. The server (0x294C610 → 0x28F82A0) picks one of two paths: "target is in the party" (just swap control) or "target is not in the party" (bring the target over, then re-apply the remembered list).
+
+**What is different for Kliff:**
+- He has no mercenary record, so the game never re-summons him. Damiane and Oongka are summoned next to you when missing; Kliff must already be valid where he is. On the server that failure is eErrNoFailToSummonMercenary. On the client it is the actor lookup 0x8AE940 failing, which gives eErrNoInvalidFocusActorKey.
+- His cooldown is the clan+0x88 entry with mercenary number -1, not a per-mercenary entry.
+- A special character index (global +0x10A) skips the "target must be in the party" rule and the distance rule. Kliff is very likely that index, but this needs a runtime check.
+
+**What can block only Kliff (most to least likely):**
+1. He is out of reach or not valid where he is: he did not follow your new character, so the client no longer has his actor; or he is downed (cc+0x273), dead, or his AI is busy (0x1F5ABC0).
+2. His -1 cooldown entry is running or stuck. An entry with +0x18 non-zero never counts down.
+3. His character key is in the remembered list clan+0xE8 (refusal slot 0xEC). The server log showed remembered 0 on the server, so the client's copy would have to differ.
+4. Only if +0x10A is not Kliff: the party list is non-empty and has no Kliff entry (slot 0xE6), or, on the client, he is in the list but far away and off screen (slot 0xE4 or 0xEA).
+5. A data-driven block list for the field or region (slot 0xD4).
+
+**How the plugin could contribute:**
+- Register passes the current control character's key. If you recruit while playing Damiane, she gets an entry and Kliff gets none. That only matters in case 4.
+- RemoveAccompany removes the control character's own entry when it is the only one left. It then runs 0x2152070 on the control character with r9b=1, which calls the safe-spot teleport 0x2B98E20.
+- Any explicit-key AccompanyMercenary call clears the remembered list (0x2150A59).
+
+**Repair:** one server-thread call to AccompanyMercenary with keys {owner key, control key, every current entry's key}. It is idempotent. It clears the remembered list, creates Kliff's entry if missing, re-arms his actor, and resends the full list. The client then replaces its list and zeroes its remembered count (0x9E46F0). This fixes cases 3 and 4 and any client/server mismatch. Being out of reach is fixed by teleporting Kliff to the control character; a cooldown or a downed Kliff by waiting.
+
+**Diagnostic:** log only. In H0, log every 0x8F0, 0xA9A and 0x84A packet with its target key and the returned error. If no 0x8F0 for Kliff's key appears when you try, the client refused. Then add a log-only detour on 0x17EC980 that records the returned message slot. That names the failing check in one test.
+
+The game is still running the older plugin. The .asi deployed at 16:19:49 already contains WatchList, which logs the full party list and the control character on every change.
+- [high] The client request path is: UI predicate 0x17EC980, then 0x4FA8A0, then 0x8F0 StartChangeFocusActorReq sent by 0xB6E0A0. 0x7797F0 then sends 0xA9A ChangeFocusActorReq through 0xB6DDE0. 0x4FA8A0 is (clientOwner rcx, u32* err, u32* targetKey, u16 r9, 5th arg, u8 force as 6th arg).
+    pkt_ids: 08F0 StartChangeFocusActorReq handler 0x298D940; 0A9A ChangeFocusActorReq handler 0x298D490; 0BBA/0B68 acks; 084A ChangAIChartForFocusActorChangedReq handler 0x2982550. 0xB6E18C writes id 0x8F0 and is only called from 0x4FAEA8 inside 0x4FA8A0; 0xB6DDE0 (id 0xA9A) is only called from 0x779B57 inside 0x7797F0. 0x4FA8A0 calls 0x17EC980 at 0x4FAA03. The UI also calls the predicates from 0x654AE0 (0x17ECB50 directly, per target) and from 0x654520, 0x96B990, 0xEFAF10 and 0xEFE330. The H0 payload starts with the u16 packet id (0x2773CD7 movzx edx,[r13]); the length is at +3 and the data at +5.
+- [high] Server 0x8F0 path: 0x294D5B0(charHolderComp, &err, targetKey, u8 force). It fails with eErrNotFoundFocusActor if there is no control character. Unless force is set, it fails with eErrCantChangeFocusActor when [owner+0xC3]==0 or when 0x17EC980 is false. It then sets [owner+0xC3]=0, sets bit 4 of cc+0x398 on the control character and on the target, and sends ack 0xBBA.
+    0x294D64B 0x206AE30 → 0x6CF6EBC; 0x294D755..0x294D775 [r14+0xC3] check → 0x6CF6EC0; 0x294D856 0x17EC980 → 0x6CF6EC0; target == the owner's index (0x294D9C5) takes the owner path (owner->vt+0xC0(4,0x10)); a mercenary takes 0x214E7A0 record → actor lookup, and an invalid record gives eErrNoInvalidActorType 0x6CDB9E0 (0x294DDCA). Writes at 0x294DB84 and 0x294DB99; 0x219D95C sets +0xC3 back to 1. Because Damiane and Oongka switches work, +0xC3 is not stuck.
+- [high] Server 0xA9A path: 0x294C610 sets a 'summon' flag when the target's index is not in clan+0xB8. The flag is forced off when the control character's cc+0x340 is set or when the target is the special index [[[[base+0x6D69530]]+8]+0x28]+0x10A. 0x28F82A0 then fails with eErrCantChangeFocusActor if the target is already the control character. The owner/Kliff path needs owner->vt+0xC0(4,0x10), else eErrNoFailToSummonMercenary, and has no re-summon. The mercenary path takes the record actor or summons with 0x2BA9340. With the flag off it swaps control; with it on it brings the target over and re-applies the remembered list.
+    0x294D2C0..0x294D34D list scan; 0x294D363 cc+0x340; 0x294D39F +0x10A; 0x28F844F ctrl key == target → 0x6CF6EC0; 0x28F85E0..0x28F8605 owner path and 0x28F8DD0 → 0x6CF6F68; 0x28F86BC 0x214E7A0, 0x28F8BA5 0x2BA9340. Swap path: 0x28F9242 [owner+0xC3]=0, cc+0x398 bit-4 swap, 0x28F92F7 0x206AEC0 sets the control character, 0x2AF86E0 field move, ack 0x2988EF0. Summon path: 0x2BC4950, then 0x28F953B 0x2BCA3D0 → 0x2BC96C0 → 0x2BC9B70 → AccompanyMercenary with an empty key list (0x2BC9D5E). The requested transform teleports any target at 0x28F8F17.
+- [high] Shared target check 0x17ECB50(ctrl, targetKey, u16* msg, u8 1). Refusal slots are u16 values at T+off, with T=R64(R64(R64(R64(base+G))+8)+0x1C0); G is 0x6D69528 on the client and 0x6D69530 on the server. Slots: 0xD4 = field or region block list, target AI busy (0x1F5ABC0) or mercenary state 0; 0xDC = cooldown in clan+0x88 or target dead (0x17F6B00); 0xCC = owner comp+0x120 byte +0x18; 0xD2 = field state; 0xD0 = owner comp+0x178 slots +0x30/+0x48 not 0xFFFF; 0xEC = target key in remembered list clan+0xE8; 0xE6 = party non-empty and target not in it; 0xE8 = mercenary state 3; 0xDE = target downed (cc+0x273); 0xEA/0xE4 = in party but far and off screen.
+    0x17ECE62/0x17ECE72 block lists; 0x17ECF40..0x17ECFF5 owner cooldown (needs active byte +8 and [+0]==-1; remaining is end(+0x10)-[+0x18] when +0x18 is non-zero, else end-now via 0x1416B80); 0x17ECFFA CC; 0x17ED03B D2; 0x17ED071 D0; 0x17ED094..0x17ED0AC owner key → edi=[owner+0x60]; 0x17ED100..0x17ED126 clan+0xE8 scan → EC; 0x17ED13F cc+0x340 and 0x17ED14C special index skip; 0x17ED178 0x21522F0 copies clan+0xB8 → E6; 0x17ED39E 0x1F5ABC0; 0x17ED3F9 +0x273; 0x17ED489 ctrl->vt+0x230. vt+0x230 is 0x4FAF30 (distance plus camera check) on ClientActor and 0x359BA0 (always false) on ServerActor, so 0xE4/0xEA can only come from the client.
+- [medium] The special index at +0x10A is very likely Kliff, the main character. If so, Kliff is exempt from the party-membership rule (0xE6) and the distance rule, and always takes the in-party path. In that case whether his own entry is in the list does not matter for switching to him.
+    The same index is used to skip both rules (0x17ECC0A, 0x17ED14C) and to force the in-party path (0x294D39F). Without that exemption, vanilla could never switch back to Kliff after forming a party while playing Damiane: 0x293DDE0 adds only the control character's key, and only the owner's key produces Kliff's entry. Other users of the index (0x5DB8C7, 0x9C4AD7, 0x15E80DF, 0x293379A) treat one character specially. Its value is runtime data and was not read.
+- [high] Refuted: a stale actor key in Kliff's entry cannot break the switch. The switch code does not use the accompany list to find any actor. Kliff's entry is in vanilla format.
+    The list is only scanned for character index (u16) membership: 0x294D316, 0x17ED1A6, 0x4FAB56. Kliff's actor comes from [owner+0x60] (0x17ED0A9; client 0x4FAAEB); a mercenary's comes from record+0x50 through 0x214E7A0. AccompanyMercenary compares each key with the owner's key (rsi=[clan+8]) and writes {idx, [owner+0x60], 2, -1} (0x2150C65..0x2150C73). The owner never changes on a focus change; only user+0xD8 changes (0x206AEC0). No switch check reads the entry type or the order of entries.
+- [high] How vanilla builds the leader entry. 0x293DDE0 appends the current control character's key; it becomes the leader entry only when the control character is the owner, and a non-owner control character (Damiane) gets a normal record entry. The re-apply 0x2BC9B70 passes an empty key list, so the keys come only from the remembered list and no leader key is added. Any explicit-key AccompanyMercenary call clears the remembered list first.
+    0x293DE2E..0x293DF36 control key from [[ctx+0x30]+0xA0]+0xD8; 0x2BC9C32..0x2BC9CA8: it runs when a main mercenary or the owner is missing from clan+0xB8, then calls 0x2150930 with count 0; 0x2150A59 sets clan+0xF0=0 when count is non-zero; 0x2150F55..0x2150FAA uses up the remembered keys. The 'N new' output list leaves out the control character's own entry (0x2151070..0x2151085). The client sync sends the whole clan+0xB8 list (0x2151275..0x2151298), and the client's 0x9E46F0 replaces its list and zeroes its clan+0xF0 (0x9E472C).
+- [high] RemoveAccompany removes the CONTROL character's own entry when it is the last one left. It then runs 0x2152070 on the control character with r9b=1, which calls the safe-spot teleport clan vt+0x180 0x2B98E20. It clears the remembered list only when a6 is set.
+    [rsp+0x70] is the control character (0x21515B9 → 0x206AE30); 0x2151CB7..0x2151DD9 runs when count==1 and the index matches; the control character's actor and character keys go into the removed lists, which feed 0x2152070 (0x2151ED1..0x2151EDF); 0x2151E01 clears clan+0xF0 only when a6 is set. So dismissing the last comrade while playing Kliff removes Kliff's own entry and moves the player's character to a safe spot. The client update goes through the protected vt+0x178 → 0x9E4840, so whether it touches the client's remembered list is not known.
+- [medium] The plugin's registration also re-arms Kliff's own actor. 0x2B98830 runs 0x21514A0 on every new entry's actor, including the owner: it clears character flag 0x100000 and clears fields of [[actor+0x68]+0xB0], the same component the 0xD4 'AI busy' check reads. Vanilla 0x293DDE0 does the same to the leader in quests, so this is probably harmless, but it is a plugin-triggered touch of Kliff's AI component.
+    0x2B98935 calls 0x21514A0 for each entry with a found actor. 0x21514BD..0x21514C6 calls 0x1795490(cc, 0x100000, 0); 0x21514ED..0x2151508 zeroes +0xD8, +0xE8, +0x118 and resets the +0x120 vector; 0x17ED3A2 then reads [[actor+0x68]+0xB0] for the 0xD4 check.
+- [medium] The current log does not identify which list entries existed. In the sequence list 2 → 3 → 2 → (2, remembered 2) → 4 between 16:09:19 and 16:09:30, the server's remembered list was 0 for the whole period when the failure reportedly started. Around 16:17:34 the Max recruit added 1 new entry and left a list of 2. That fits a registration made while playing Damiane or Oongka (keys {control character, Max}), with Kliff not added.
+    Log lines 18, 496, 504, 510, 513, 614..627 and 728 of E:\SteamLibrary\steamapps\common\Crimson Desert\bin64\GreymaneCompanions\GreymaneCompanions.log (read only). The running build had no WatchList; the .asi deployed at 16:19:49 contains 'party: you play'. The 'you at' position comes from client holder+0x50 (Open()), and the client keeps that separate from the control character ([[holder+0x58]+0xD8], 0x8B4570). So 'you' may be Kliff rather than the character being played, which affects all of the plugin's distances.
+- [high] Being in the list is required only for targets that are not exempt. For any target that is in the list, being in the list also enables the client's far-and-off-screen refusal. On the client, a far party member just gets the 'bring over' flag and a teleport transform, but only if the client actor lookup 0x8AE940 finds him first; otherwise the request fails with eErrNoInvalidFocusActorKey before it is sent.
+    0x4FABD2..0x4FAC00 lookup → 0x6CF6EB8; 0x4FAC32..0x4FAC52 r14b = not in list or 0x4FAF30; the UI state byte [[0x6D69190]+0x60]+0x15C in 1..0x17 gives eErrCantChangeFocusActor (0x4FA9D1).
+ACTIONS:
+ - DIAG-0 (log only, no new game calls): in H0, after calling the original, read id=R16(payload). For id 0x08F0 log target=R32(payload+5) and force=R8(payload+9); for 0x0A9A log target=R32(payload+5), B=R32(payload+9), C=R32(payload+0xD); for 0x084A log the id. In each case also log *out with ErrorText. If you try to switch to Kliff and no 0x8F0 with Kliff's key appears, the client refused.
+ - DIAG-1 (state dump on every control change seen by WatchList and on every 0x8F0): log the owner key/index/actor and the control key/actor; R8(owner+0xC3); the special index R16(R64(R64(R64(R64(base+0x6D69530))+8)+0x28)+0x10A) next to Kliff's index R16(R64(R64(owner+0x68)+0x20)+0x30); the server list; the remembered keys R32(R64(clan+0xE8)+4*i) for i < R32(clan+0xF0); the cooldowns at R64(clan+0x88), count R32(clan+0x90), stride 0x28 {u64 merc +0, u8 active +8, u64 end +0x10, u64 frozen +0x18} with now from 0x1416B80(); Kliff's cc=R64(R64(owner+0x68)+0x20): +0x273, +0x320, +0x390|+0x394, +0x340, +0x398; R8(R64(R64(owner+0x68)+0x120)+0x18); R16 at R64(R64(owner+0x68)+0x178)+0x30 and +0x48; the server distance from the control character to Kliff. Also log the CLIENT copies under __try: holder=R64(R64(base+0x6D69190)+0x30), clientOwner=R64(R64(holder+0x58)+0xD0), clientClan=R64(R64(clientOwner+0x68)+0x110) with vt == base+0x55BE900, and its +0xB8/+0xC0, +0xE8/+0xF0 and +0x88/+0x90.
+ - DIAG-2 (only if DIAG-0 shows a client refusal): a log-only MinHook detour on 0x17EC980, signature bool __fastcall(uintptr_t ctrl, uint32_t targetKey, uint16_t* msg). Prologue 48 89 5C 24 10 48 89 74 24 18 57 48 83 EC 20 48 8B 01 49 8B F0 8B DA 48 8B F9 FF 90 78 01 00 00; check that it is unique. Call the original; when it returns false, log the side (TLS+0x1EC), ctrl key, target key and *msg, plus the slot whose u16 equals *msg among T+{0xCC,0xCE,0xD0,0xD2,0xD4,0xD8,0xDA,0xDC,0xDE,0xE0,0xE4,0xE6,0xE8,0xEA,0xEC}, where T=R64(R64(R64(R64(base+(side?0x6D69530:0x6D69528)))+8)+0x1C0). Log only when the (side, target, msg) combination changes, because the UI calls it every frame.
+ - REPAIR (server thread, H0, owner lock not held, skip while remembered != 0 or a switch is in progress): AccompanyMercenary 0x2150930(clan, &err, keys={ownerKey, controlKey if different, the character key of every current clan+0xB8 entry}, out). It is idempotent. It clears the server's remembered list (0x2150A59), creates Kliff's {idx, [owner+0x60], 2, -1} entry if missing, re-arms new entries, and sends the full list through 0x9FB; the client 0x9E46F0 then replaces its list and zeroes its remembered count. ownerKey = R32(charInfo(&R16(R64(R64(owner+0x68)+0x20)+0x30))). If Kliff is out of reach instead, teleport the owner next to the control character with the same safe-spot path the plugin uses for comrades (clan vt+0x180 0x2B98E20, or the 0x17FA6C0/0x2443E60/0x2B97DF0/0x2BCD120 sequence), then switch. Save and reload only rebuilds the client's copy (0xBE4A90 → 0x2155810); the server lists, including +0xB8 and +0xE8, are saved (0x2BB81D0).
+ - PLUGIN-1: in Register, pass keys = {ownerKey, controlKey if different, comrade} instead of {controlKey, comrade}. Kliff then keeps a party entry even when you recruit while playing Damiane or Oongka. It costs nothing when you play Kliff, because duplicates are skipped.
+ - PLUGIN-2: never call AccompanyMercenary, RemoveAccompany, SetAccompanyType or Disband while a switch is in progress: R8(owner+0xC3)==0, or bit 4 of cc+0x398 set on the owner or the control character, or within about 2 s of a control change seen by WatchList. Keep the existing remembered != 0 guard.
+ - PLUGIN-3 (dismiss): before RemoveAccompany, if the list is exactly {control character's own entry, her}, log that the game will also remove the control character's entry and teleport the player's character to a safe spot (0x2152070 → vt+0x180). Prefer leaving the leader entry in place: when the control character is the owner, re-register {ownerKey} afterwards only if other party members remain.
+ - PLUGIN-4: after every control change and every clan call, check and warn: (a) a non-empty list contains the owner's index and the control character's index; (b) the owner key is not in clan+0xE8; (c) no entry has index 0xFFFF or actor 0, because the client then ignores the 0x9FB update.
+ - PLUGIN-5: measure distances, catch-up and rescue from the control character's position ([[owner+0xA0]+0xD8]) and not from holder+0x50, unless DIAG-1 shows they are the same actor after a switch.
+OPEN:
+ - What is the special index at +0x10A at runtime? Is it Kliff's character index? DIAG-1 answers this. If it is not Kliff, the 0xE6 and 0xE4/0xEA rules apply to Kliff, and PLUGIN-1 plus the REPAIR call become the fix.
+ - Which message or slot does the game show when switching to Kliff fails? The on-screen text alone would separate cooldown (0xDC), remembered (0xEC), not in party (0xE6), unavailable (0xD4) and downed (0xDE).
+ - Does the same failure happen without the plugin: call Damiane and Oongka, switch to Damiane, walk 100 m, switch back?
+ - Who adds clan+0x88 cooldown entries with mercenary number -1 (Kliff's), and when is +0x18 (frozen) set? The writer was not found in plain code and is probably in protected .xtls.
+ - Does the client's protected removal sync (vt+0x178 0x2B98D90 → client 0x9E4840) write the client's remembered list clan+0xE8? A stale client remembered list containing Kliff's key would give slot 0xEC on the client only.
+ - Does client holder+0x50 follow the control character after a switch, or always stay Kliff? The plugin's 'you at' position and all its distances depend on it.
+ - What did the list hold at 16:09:19..30 (3 → 2 → remembered 2 → 4)? Was it a vanilla party call, or the player's first switch through the 'not in party' path followed by the re-apply 0x2BC9B70? The WatchList dump in the 16:19 build will show it.
+ - Kliff's client streaming range: does the client keep the owner's actor at any distance? If not, a Kliff who does not follow eventually gives eErrNoInvalidFocusActorKey.
+===== research:horse
+SUMMARY: I worked on the user's actual request (Kliff switch). The horse question from the computed task got only a short pass, listed at the end of the findings.
+
+The switch goes through the game's 'focus actor' path:
+- client: the quick slot 0xEFE330 -> check 0x17EC980 -> 0x64FA00 -> 0x4FA8A0 -> 0xB6E0A0, which sends TrocTrStartChangeFocusActorReq 0x8F0 {u32 target key, u8}
+- server: handler 0x298D940 -> 0x294D5B0. It runs the same check 0x17EC980 on the control actor and fails with eErrCantChangeFocusActor 0x6CF6EC0.
+- then TrocTrChangeFocusActorReq 0xA9A -> 0x298D490 -> 0x294C610 -> 0x28F82A0, which writes [userObj+0xD8] = the new control actor via 0x206AEC0.
+
+Every refusal that is specific to the target comes from 0x17ECB50(actor, key, u16* msg, partyCheck=1). The checks that can block Kliff while Damiane and Oongka still work:
+- (a) a call cooldown for the clan owner. clan+0x88 holds entries of 0x28 bytes; Kliff's entry has mercNo -1 and isOwner 1. Kliff, Damiane and Oongka all have characterinfo _callMercenaryCoolTime = 600 s with _mercenaryCoolTimeType = 1. The game adds this entry when the character is taken out of the party while downed or dead (0x2152070 -> clan vt+0x1C8 0x2B9A390). It blocks for 10 minutes, or for as long as the cooldown is paused (+0x18 != 0, set through clan vt+0x1B8 0x2B91370).
+- (b) Kliff downed (0x17F6B00) or dead.
+- (c) Kliff's key is in the called list clan+0xE8 (message +0xEC). The client keeps its own copy of this list.
+- (d) a party exists and Kliff is not in it (message +0xE6). This is skipped when Kliff's index equals a global 'special' index ([[[G]]+8]+0x28 -> +0x10A, almost certainly Kliff's).
+- (e) client only: Kliff is in the party but far away and off screen (client actor vt+0x230 = 0x4FAF30; message +0xE4, or +0xEA if he is in combat).
+- (f) a stage exclusion, or a silent failure.
+
+The plugin never touched Kliff except one thing: its AccompanyMercenary {Kliff, Luceran} at 16:04 created Kliff's own party entry. The game also does this when you call Damiane as Kliff. The dismiss only touched Luceran, which fits 'still broken after dismiss'.
+
+Log timeline (medium confidence), from the 16:02 session log:
+- 16:09:19: you switched to Damiane. 'You' jumped 41 m, the list went from 2 to 3 (she was summoned) and Luceran was warped to 1.8 m.
+- 16:09:24: the list went from 3 to 2.
+- 16:09:28: 2 keys were called.
+- 16:09:30: the list had 4 entries.
+
+Exactly which check fails can't be settled statically: it depends on live state (cooldown entries, downed state, the client list, the special index). The fastest answer is a read-only probe in the plugin. It logs the u16 message 0x17EC980 returns for key 1 and maps it to the check name, and it logs Kliff's server state. The things the user can try right now are in open_questions.
+- [high] The character switch is the game's 'focus actor' change, a two-step client/server exchange, and the server re-runs the same check the UI runs.
+    Client: UIGamePlayControlMercenaryQuickSlot (vt 0x56B2158) slot +0x530 = 0xEFE330. It reads the slot's character key and calls 0x17EC980(actor, key, &msg) at 0xEFE498; if that passes it calls 0x64FA00 -> 0x4FA8A0. 0x4FA8A0 calls 0x17EC980 again at 0x4FAA03 (error eErrCantChangeFocusActor 0x6CF6EC0), then 0xB6E0A0, which builds packet 0x8F0 (mov ecx,0x8F0 at 0xB6E18C) = TrocTrStartChangeFocusActorReq {u32 key, u8}. Server handler 0x298D940 -> 0x294D5B0(senderCc, &err, key, flag). It needs [sender+0xC3] != 0 (cleared at 0x294DB84 while a change is under way), then calls 0x17EC980(controlActor, key) at 0x294D856, which fails with 0x6CF6EC0. Then TrocTrChangeFocusActorReq 0xA9A handler 0x298D490 -> 0x294C610 -> 0x28F82A0; 0x28F92F7 calls 0x206AEC0, which writes [user+0xD8] = new control (0x206AF13).
+- [high] 0x17EC980 = CanSwitchTo(actor, key, u16* msg): generic checks on the control actor, then the target checks in 0x17ECB50 with partyCheck=1. Since Damiane and Oongka work, the generic part passes; Kliff fails in 0x17ECB50 or in a silent path.
+    0x17EC980:
+- control vt+0x178 = [actor+0x94] (0x8A67D0); false = fail
+- same key as the actor's own = fail
+- if byte [0x6CE0E18]: the SwitchCharacter (type 8) player-behaviour check 0x1571720 -> 0x1571550 (in combat 0x17EC130, fatal/dead, vehicle eErrCharacterSwitchNotAllowedOnThisVehicle 0x6CF7B10, no space), mapped to msg +0xDE / +0xDA / +0xE0 / +0xD8
+- 0x17ED580 (holder busy / riding / groggy: msg +0xCC, +0xCE, +0xD0, +0xD2, +0xD6, +0xDC)
+- 0x17ECB50(actor, key, msg, r9b=1) at 0x17ECB23.
+msg values are u16 read from [[[G]]+8]+0x1C0 at those offsets; G = 0x6D69528 on the client, 0x6D69530 on the server.
+- [high] The target checks in 0x17ECB50 (holder = [[actor+0xA0]+0xD0] via 0x17EE020, clan = [[holder+0x68]+0x110]):
+(1) target key in the stage list stage+0x1A0, or in a stage spawn entry (stage+0x1B0) -> msg +0xD4
+(2) cooldown -> +0xDC
+(3) holder states -> +0xCC / +0xD2 / +0xD0
+(4) the target is the holder's own character (Kliff), else it needs a mercenary record (mercNo -1 = silent fail)
+(5) target key in the called list clan+0xE8/+0xF0 -> +0xEC
+(6) if the control's [cc+0x340]==0 and the target index != special [[[G]]+8]+0x28 -> +0x10A: the list clan+0xB8 is non-empty and the target is not in it -> +0xE6
+(7) target actor: merc state 0 -> +0xD4, 3 -> +0xE8; 0x1F5ABC0 false -> +0xD4; dead -> +0xDE; downed (0x17F6B00) -> +0xDC
+(8) target in the party and actor vt+0x230(actor, target) true -> +0xEA if the target is in combat (0x17EC130), else +0xE4.
+    Disassembly of 0x17ECB50:
+- stage lists 0x17ECD1C..0x17ECDBB
+- record lookup 0x214E7A0 at 0x17ECDFF
+- cooldown 0x17ECE26..0x17ECE60 and 0x17ECF40..0x17ECFF5
+- holder +0x120/+0x49/+0x178 at 0x17ECFFA..0x17ED0D9
+- called list 0x17ED103..0x17ED126
+- party test 0x17ED13F..0x17ED212 (0x21522F0 copies clan+0xB8)
+- target actor 0x17ED2DD..0x17ED52B.
+Server actor vt+0x230 = 0x359BA0 (returns 0), so check 8 exists only on the client, where vt+0x230 = 0x4FAF30: target farther than the runtime float [0x6C94258] and not visible (0x4FB120/0x4FB3B0).
+- [high] Kliff, Damiane and Oongka each have a 10-minute call cooldown that the game sets when the character falls while in the party. While the cooldown runs, or while it is paused, switching to that character is refused with msg +0xDC.
+    Characterinfo field names come from the reader (wf4\charinfo_reader.txt):
+- +0x70 _callMercenaryCoolTime
+- +0x78 _callMercenarySpawnDuration
+- +0x80 _mercenaryCoolTimeType
+Parsed values: Kliff 1, Damian 4 and Oongka 6 have cool=600, type=1 (67 characters have type 1). Comrades (Max 0x280, Luceran 0xF4BC3) and horses have type 2, cool 0.
+0x2B9A390 = clan vt+0x1C8. If type==1 and cool>0 it calls 0x214E080(clan, mercNo, isOwner = (actor key == owner key), now+cool*1000), then sends 0x901. The entry is {u64 mercNo (-1 for the owner) +0, u8 isOwner +8, u64 end +0x10, u64 pausedAt +0x18}, stride 0x28, data clan+0x88, count +0x90.
+0x2152070 calls vt+0x1C8 when it removes an entry whose actor is dead or downed (RemoveAccompany's path).
+clan vt+0x1B8 = 0x2B91370 pauses (+0x18 = now) or resumes (end = now + cool) a cooldown.
+Entries are removed only by 0x214E290, through 0x2B90D90 when the client sends TrocTrCallMercenaryCoolTimeCompleteReq 0x859 (0x2A31410 -> 0x2C498A0).
+In 0x17ECB50, remaining = pausedAt ? end-pausedAt : max(end-now,0), so a paused entry blocks for good.
+- [medium] The game treats one character index ([[[G]]+8]+0x28 -> u16 +0x10A, almost certainly Kliff) specially. It is never added to the party when you switch away from it, and the 'target must be in the party' check is skipped for it.
+    0x294C610:
+- r13b = the old focus character is not in clan+0xB8 (0x294D2E2..0x294D328)
+- forced to 0 if [cc+0x340] or index == [..+0x10A] (0x294D363..0x294D3A8)
+- passed to 0x28F82A0, which runs 0x2BCA3D0 (party warp/summon) only when it is set (0x28F9522..0x28F953B).
+0x17ECB50 skips the party test when the index == [+0x10A] (0x17ED14C).
+The value is runtime data, so it is not read statically.
+- [medium] The quick slot treats Kliff differently from the other two. If he is in the party, his slot uses the switch path. If not, it uses 0x17EC440, which refuses a target that IS in the party and is followed by a 'call' (adds keys to the client clan's called list) rather than a direct switch.
+    0xEFD100 (slot state, called from 0xEFD770 in vt slot 0xEFD580). For the Kliff slot (+0x17E):
+- returns 3 if you already play him
+- returns 2 if 0x650B60 finds his index in the client clan+0xB8 (in party)
+- otherwise returns 0/1 from 0x17EC440 at 0xEFD20D.
+0x17EC440 returns false if the key's index is in clan+0xB8 (0x17EC554..0x17EC5A9). It also does the field check and the type-8 behaviour check, and calls 0x17ECB50 with partyCheck 0 at 0x17EC7C8.
+Action 3 in 0xEFD810 -> 0x650430: if the current control is not in the party it adds its key (0x9E6AC0), then adds the target's key to the client clan +0xE8 list.
+- [medium] The plugin did nothing to Kliff except create his own party entry, through AccompanyMercenary {controlKey=Kliff, Luceran} at 16:04. The dismiss (RemoveAccompany with Luceran only, a4..a7 = 0) cannot have put a cooldown on Kliff.
+    game.cpp Register(): keys {c->controlKey, key}. Notes: the owner's own key gets {idx, [owner+0x60], type 2, mercNo -1}. The vanilla call path adds the control character's key too (0x650430 adds the current character if it is not in the party; the stage path 0x293DDE0 passes the control key).
+DismissHeld: g_removeAccompany(c->clan, &err, {Luceran idx}, 0,0,0,0) -> 0x2152070 runs only on Luceran's actor, and his coolTimeType is 2 (no cooldown).
+The 16:02 log has no 'WARNING: list entry has no actor' line, so the client's list sync was not dropped.
+- [medium] Likely timeline from the 16:02 log: the switch to Damiane happened at 16:09:19. Damiane was summoned and the party was warped. One entry left the list at 16:09:24, then 2 keys were called and the list reached 4.
+    Pump lines:
+- 16:09:17 'you at -10470.8 612.1 -4516.9', 16:09:19.8 'you at -10481.5 611.4 -4557.0' (41 m jump; c->player is the client's self character)
+- 16:09:18.986 Luceran flags 0x1000 -> 0
+- 16:09:20 Luceran 48.5 -> 1.8 m 'JUMPED', AI sequence 45 -> 48 (consistent with the party warp 0x2BCA3D0 in the focus change)
+- list 2 -> 3 (16:09:19.8) -> 2 (16:09:24) -> 'list 2, remembered 2' (16:09:28) -> 'list 4' (16:09:30).
+Which entry left at 16:09:24 (Damiane's or Kliff's) cannot be told from this build. The 16:12 build's WatchList ('party: you play character ... / accompany list now') will show it.
+- [medium] Horse question (short pass only): companions call their horse through an action-chart frame event, ClientFrameEventCallMercenary, which the client running that actor's chart executes before it sends FrameEventCallMercenaryReq 0x876.
+    ClientFrameEventCallMercenary vtable 0x55852B0, execute slot +8 = 0x7FBAD0, registered at 0x7FC994. Its thunk 0x808D30 -> 0x7FCC70 -> 0xBE3190 builds 0x876 (mov ecx,0x876 at 0xBE32B9).
+0x7FBAD0 requires:
+- actor key bit 30 clear
+- [actor+0xA0] user object, else eErrNoInvalidUserActor 0x6CF7188
+- main player logged in (0x206BA40), else eErrNoSelfPlayerIsNotLogin 0x6CF6BF4
+- the vehicle record from 0x214C3C0(clan, group, idx), which matches mercenaryinfo +0x70 == group and characterinfo +0x6E == idx; else eErrNoCantFindVehicleActor 0x6CF2638 (0x7FC022).
+Also eErrNoIsNotVehicle 0x6CE8CD8 and eErrNoInvalidReservedVehicle 0x6CF79E0.
+The group comes from the frame-event data +0x68 through the protected 0x8087E0.
+Not verified: whether a camp comrade's actor has [actor+0xA0], and whether his chart contains the action that fires this event.
+ACTIONS:
+ - PROBE 1 (read-only hook): bool __fastcall CanSwitchTo(uintptr_t actor /*rcx*/, uint32_t key /*edx*/, uint16_t* msg /*r8*/) at 0x17EC980. The 24-byte prologue is unique: 48 89 5C 24 10 48 89 74 24 18 57 48 83 EC 20 48 8B 01 49 8B F0 8B DA 48. It runs on the client UI thread and on the server thread. In the detour, call the original. Then, if key==1 (or key is 4 or 6, for comparison), log when (thread, result, *msg) changes: thread (OnServerThread), actor key R32(actor+0x60), result, *msg.
+Map *msg to a check name:
+- p = R64(R64(R64(base + (server ? 0x6D69530 : 0x6D69528))) + 8); s = R64(p + 0x1C0); for off in 0xCC..0xEE step 2, if R16(s+off) == *msg print off.
+- names: CC holder busy, CE holder state!=7, D0 holder slots in use, D2 field/region, D4 stage-excluded/unavailable, D6 control comp busy, D8 behaviour refused, DA no space, DC cooldown OR downed, DE dead, E0 vehicle, E4 far+off-screen, E6 not in party, E8 merc state 3, EA far+in combat, EC in called list.
+- *msg still 0xFFFF on failure = a silent path (no holder/field/record, or [actor+0x94]==0).
+Wrap everything in __try and call no other game function in the detour.
+ - PROBE 2 (read-only hooks):
+- 0x294D5B0(uintptr_t senderCc, uint32_t* err, uint32_t key, uint8_t flag), taken from the E8 at 0x298DA8C (its prologue is not unique). After the call, log key, flag and *err by name; add 0x6CF6EC0 eErrCantChangeFocusActor, 0x6CDB9E0 eErrNoInvalidActorType and 0x6CF6B54 eErrNoInvalidField to ERRORS.
+- 0x294C610 from the E8 at 0x298D74C (rcx = cc, rdx = u32* err, r8d = key): log *err after the call.
+ - PROBE 3 (pump, server thread, every 2 s on change while c->control != c->owner). Read under the owner's read lock, as ReadClan does:
+(a) Kliff's entry in clan+0xB8 (index R16(R64(R64(owner+0x68)+0x20)+0x30)) and its actor and type
+(b) the cooldown list: data R64(clan+0x88), count R32(clan+0x90), stride 0x28 {u64 mercNo +0, u8 isOwner +8, u64 end +0x10, u64 pausedAt +0x18}. Compute now = ((uint64_t(*)())(base+0x1416B80))() (server: no offset). Log mercNo, isOwner, remaining = pausedAt ? end-pausedAt : max(end-now,0), and paused yes/no
+(c) the called list: u32 keys at R64(clan+0xE8), count R32(clan+0xF0)
+(d) owner cc = R64(R64(owner+0x68)+0x20): dead R8(cc+0x273), groggy (int)R32(cc+0x320)>0, R8(cc+0x340); the control's R8(cc+0x340)
+(e) R8(owner+0xC3) and R8(player+0xC3) (the 'can start a focus change' byte; 0 blocks every switch)
+(f) the special index R16(R64(R64(R64(R64(base+0x6D69530))+8)+0x28)+0x10A) next to Kliff's index
+(g) the distance from the control actor to the owner (WorldPos).
+ - TEST (on a backup save) with the probes:
+(1) As Kliff, call Damiane and switch to her.
+(2) Try to switch back at once, then again after more than 10 minutes, after a fight, and after a reload.
+(3) The same on a save from before Test 4 with GreymaneCompanions.asi removed, to see whether vanilla behaves the same way.
+The probe line for key 1 names the failing check.
+ - FIX, chosen by what the probe shows:
+- E6 (Kliff not in the party and Kliff is not the special index): re-add his owner entry with the existing Register(c, 1), i.e. AccompanyMercenary(clan, {controlKey, 1}). Key 1 is the owner's, so the game builds {Kliff idx, [owner+0x60], 2, -1}. Run it only when RememberedClear (clan+0xF0 == 0). It could be a hotkey or done automatically when Kliff's entry is missing while you play someone else.
+- DC with an owner cooldown entry that is not paused: vanilla behaviour after Kliff fell; wait up to 600 s.
+- DC with the entry paused: clan vt+0x1B8 0x2B91370(clan, pause=0, mercNo=-1, isOwner=1) resumes it, but restarts a full 600 s. Avoid removing entries directly (0x214E290); the client and possibly the DB track them.
+- EC: wait for, or process, the called list (AccompanyMercenary with an empty key list uses it); on the client only, reload.
+- E4/EA: bring Kliff next to you (the plugin's safe-spot teleport on the owner actor), or walk to him.
+- DE/DC with Kliff downed: wait until he is up.
+ - Next session log: the 16:12 build's WatchList ('party: you play character %06X ...' + 'accompany list now' with names) shows whether Kliff's entry exists after the switch. The user should run that build.
+OPEN:
+ - What exactly happens when the user tries to switch to Kliff? Is the slot greyed out, is there a cooldown ring, an on-screen message (its text names the check), or does nothing happen?
+ - Does the F11 window currently show a Kliff row (Kliff is in the party), and is it marked 'Down'?
+ - Does the problem clear by itself about 10 minutes after the last fight (the 600 s cooldown)? Does it survive save -> title screen -> reload (state saved on the server or in the save, not only on the client)?
+ - Does vanilla do the same? Test: a save from before Test 4, no plugin: call Damiane as Kliff, switch to her, fight until someone is downed, then switch back.
+ - Which character index is the special u16 at [[[0x6D69530]]+8]+0x28 -> +0x10A? It is expected to be Kliff's; probe 3 logs it.
+ - Which entry left the list at 16:09:24, Damiane's or Kliff's? The 16:12 build's party log answers this.
+ - Who calls clan vt+0x1B8 (cooldown pause/resume) for the owner? Not traced; there are 349 virtual call sites at +0x1B8.
+ - Horse question, deprioritised for the user's Kliff request: does a camp comrade's actor have [actor+0xA0] (needed by the call-vehicle frame event 0x7FBAD0)? Which action in the comrade chart fires ClientFrameEventCallMercenary? How does a horse record get characterinfo +0x6E / record +0x148 linked to its rider? None of this was researched further.
+===== research:dismiss
+SUMMARY: Why you can't switch back to Kliff: the game has its own rule for this. While your party list (the accompany list) has anyone in it, you can only switch to a character who is in that list. Damiane and Oongka are in the list, so switching to them works. Kliff's own list entry (the owner entry) is evidently gone, so the game blocks him with its 'not accompanying' reason. Dismissing Luceran did not help: Damiane and Oongka keep the list non-empty, and Kliff is still not in it. The check is shared code run by both the companion quick-slot screen and the server's pre-check, and Kliff gets no exception: the only skip is for the game's 'WorldObserver' character, while Kliff is 'MainCharacterKey'.
+
+What removed Kliff's entry is not proven. The log has no plugin action at that time. The list went 3 -> 2 at 16:09:24, about 5 s after what looks like your switch to Damiane at 16:09:19 (you jumped 41 m and Luceran was caught up to you). Kliff's entry is the likeliest one dropped there, but that is an inference. The plugin also has a latent bug of the same kind: Register and Recover pass the character you control as the first key, so recruiting while you play Damiane would never put Kliff in the list.
+
+The fix is a small pump guard. While you play someone else and the list is not empty, if Kliff's entry is missing, put it back with AccompanyMercenary(clan, &err, {Kliff's key}). This is the same owner entry the game itself makes, and it sends the full list to the client, so the switch check passes again. Kliff then follows the character you play, the same way vanilla keeps Kliff in the party after a switch. A log-only probe on the check function will confirm which reason blocks him.
+
+Why Luceran vanished on Dismiss: the removal function always calls the 'move to a safe spot' teleport, with the 'teleport' flag hard-coded to 1. The search box is centred on his own position, and the spots it returns can be about 200 m away; the plugin's own rescue log shows 190-210 m. So the server moved him out of sight. On the client those clan steps do nothing, and his chart does not teleport him home either. To make him walk home: skip that one teleport during the plugin's own Dismiss call (patch one slot in the server clan's table of functions), then restart his client-side AI with the existing Resync so his camp schedule takes over. Riding home is not possible, because camp comrades have no horse records.
+- [high] Switching is checked by CanChangeFocusActor 0x17EC980(focusActor, targetCharKey, u16* outMsg). It calls the target check 0x17ECB50(actor, key, outMsg, flag=1) at 0x17ECB18. The companion quick-slot screen calls it too (0xEFE498, inside 0xEFE330), and so does the server's StartChangeFocusActor pre-check 0x294D5B0 (at 0x294D856, from handler 0x298D940). So one shared function decides on both client and server.
+    Callers of 0x17EC980: 0x4FAA03, 0x6545D4, 0x96BB9E, 0xEFAFDF, 0xEFE498, 0x294D856. In 0xEFE446..0xEFE4A6 the screen picks the target with 0xEFDD00 (the owner's index when the character-slot flag ui+0x17E is set), calls 0x17EC980, and only then sends the switch through 0x64FA00. On failure the server answers with message 0x3F5 carrying the error (0x298DA9C..0x298DB2C).
+- [high] The 'not accompanying' rule: if the party list is not empty and the target is not in it, the switch fails with the reason UI_MercenaryQuickSlot_NonSwitchable_NotAccompanying (string-manager offset +0xE6). The rule is skipped only when the character you control has cc+0x340 set, or when the target is the 'WorldObserver' code character.
+    0x17ED132..0x17ED212. r12 is the character you control. If cmp [cc+0x340],0 is not zero, the rule is skipped. If the target index equals [[[[ctx]+8]+0x28]+0x10A], it is skipped. Otherwise 0x21522F0 copies clan+0xB8 and r10b = (count != 0). The loop at 0x17ED1A0 sets al = 1 if the target is in the list. If flag && r10b && !al, it writes word [mgr+0xE6] to *outMsg and returns 0. The +0x10A field is loaded at 0x1F3FC84 from the global variable 0x6CE8E98, initialised at 0x1C03F0 with the name 'WorldObserver'. MainCharacterKey 'Kliff' (global 0x6CE8CB8, set at 0x1BFE36) is +0x100. So Kliff is not exempt.
+- [high] The reason names are known. In the LocalStringInfoManager, slots +0xCC..+0xEE are filled by its init 0x23E0D00 (vtable 0x59B80F8 +0x40). They are: +0xCC Wanted, +0xCE Crime, +0xD0 ActiveSpecialMode, +0xD2 ImportantQuest, +0xD4 Target_ImportantQuest, +0xD6 Interacting, +0xD8 Action, +0xDA InvalidPosition, +0xDC Groggy, +0xDE Dead, +0xE0 RidingVehicle, +0xE2 Stealth, +0xE4 Far, +0xE6 NotAccompanying, +0xE8 Operation, +0xEA Battle, +0xEC AlreadyCall, +0xEE NonCallable_AccompanyNotAllowed.
+    In 0x23E0D00, each lea rcx of a 'UI_MercenaryQuickSlot_NonSwitchable_*' string is followed by mov [rdi+off],ax (decoded with a script). The uses fit the meanings: +0xDE goes with the dead byte cc+0x273 (0x17ED3FD), +0xDC with the downed check 0x17F6B00 (0x17ED438), and +0xEC with the target being in pending list clan+0xE8 (0x17ED108..0x17ED278).
+- [medium] The other checks Kliff must pass as a target: a clan+0x88 timer entry with mercNo -1 (blocks as Groggy), area rules, Wanted, a stage lock, special mode, AlreadyCall (his key in clan+0xE8), Kliff's AI state 0x1F5ABC0 (Target_ImportantQuest), dead, and downed. Far and Battle are never tested for Kliff. Only NotAccompanying matches 'Damiane and Oongka work, Kliff does not'.
+    Kliff has no mercenary record, so 0x214E7A0 returns the empty record and the code goes to 0x17ECF40, which matches the owner's index and scans clan+0x88. Then come 0x17ECFFA..0x17ED0D9 and the pending scan at 0x17ED100. byte [rsp+0x20] is 0 for Kliff (set at 0x17ECC1D; only the list scan at 0x17ED1BA sets it), so vt+0x230 Far/Battle at 0x17ED470 is skipped. The checks at 0x17ED2D1..0x17ED46B run on Kliff's actor.
+- [high] How the party list reacts to a switch, from 0x214A650(clan, oldFocus, newFocus). It runs on both sides from SetControlActor 0x206AEC0 -> 0x17EA6B0 (at 0x17EAB5C). If the new character is not in the list, every entry is removed with the disband flag (a4=1). Otherwise, if the old character is not in the list, 0x2152070(old,1,1) runs on him. Playable characters are skipped either way. So in vanilla, Kliff stays in the party after Kliff -> Damiane only if his owner entry was there.
+    0x214A6E1..0x214A77B collects all indexes when the new character is missing. 0x214A7E3..0x214A7F1 calls 0x2151570(...,1,0,0,0). 0x214A802..0x214A80F calls 0x2152070(clan, old, 1, 1). 0x2151EBE..0x2151ECD and 0x21520CF skip actors with vt+0x178 = byte [actor+0x94] (0x8A67D0), the playable flag. The server switch 0x28F82A0 calls 0x206AEC0 at 0x28F92F7.
+- [medium] What removed Kliff's entry is not established. AccompanyMercenary sends the whole server list to the client, so a client/server mismatch is ruled out.
+    vt+0x158 gets {clan+0xB8, clan+0xC0} (0x2151275..0x2151298). 0x2B98D10 sends that span (0x9FB), and the client 0x9E46F0 replaces its list with it. The plugin logged nothing between 16:09:19 and 16:10:32 apart from status lines. List count went 3 at 16:09:19.8, 2 at 16:09:24, remembered 2 at 16:09:28, then 4 at 16:09:30. The running build predates WatchList, so the entries themselves were not logged.
+- [high] Latent plugin bug: Register (game.cpp ~line 597) and Recover pass keys {c->controlKey, comrade}. AccompanyMercenary makes an owner entry only for the owner's key (rsi = [clan+8], 0x2150C59..0x2150C73). Run while you play Damiane, it would add Damiane's mercenary entry plus the comrade and never Kliff, which leaves exactly the blocked state.
+    0x2150C65 looks up the owner's character key and compares it (cmp [rdi],ecx). Only on a match is the entry {idx, [owner+0x60], type 2, mercNo -1}. Other keys take the record path 0x214E7A0.
+- [high] Re-adding Kliff's owner entry is safe to do from the pump. AccompanyMercenary(clan,&err,{ownerKey}) adds {Kliff idx, owner actor, 2, -1}. It clears the pending list, so wait while remembered != 0. It re-arms the actor with 0x2B98830 -> 0x21514A0, which clears 0x100000 and resets the AI's follow fields +0xD8/+0xE8/+0x118. It then sends the full list. Kliff does not count as 'the leader', because that test is against the controlled character (0x2151070..0x2151085).
+    0x2150A59 clears clan+0xF0 when keys are given. 0x2B988F0..0x2B9894A: actor found -> 0x21514A0 -> done (the logout branch at 0x2B9899B is only for an actor that is not found). 0x21514A0 body: 0x1795490(cc,0x100000,0) and the AI field resets at 0x21514E9..0x2151502.
+- [high] Luceran vanished because RemoveAccompany always runs the clan 'safe spot' teleport on every removed non-playable actor. With a4=0 there is no disbanded flag and no unspawn, but vt+0x180 0x2B98E20 still teleports him. The search is centred on his own position, in a box of ± [0x6D08988] (set at run time). Results 190-210 m from the centre were seen in the plugin's own rescue log.
+    0x2151ED1 mov r9b,1 -> 0x2152070 at 0x2151EDF. In 0x2152070: early-outs at 0x21520AE..0x2152124 (controlled character's cc+0x340, the actor's +0x94, 0x1F5AB60). owner->vt[0x188](5) gates the AI reset 0x206EED0 at 0x215214C..0x2152185; the owner is Kliff, so it is false in practice. r14b=a4 gates the flag and vt+0x188 (0x215218A..0x21521B6). r15b gates vt+0x180 (0x21521BC..0x21521CA). 0x2B98E20: centre = his position via 0x4F8220 (0x2B98F39..0x2B98F90), then 0x2B97DF0 (box ± [0x6D08988], navmesh 0x2B03A60), then teleport 0x2BCD120 (0x2B98FDA). It is skipped only if his key is in the field's +0x1A0 list (0x2B98EC3..0x2B98EDA). Plugin log: 'safe spot -10415.3 637.1 -4775.6 (209.9 m from you)'.
+- [medium] The client does nothing to him on removal, and his chart does not 'teleport home'. The client clan's vt+0x180, +0x188 and +0x1C8 are empty functions. So the vanish is the server move, and the logout distance restored to 64 m then lets the clean-up log him out; the camp schedule respawns him later (not verified).
+    ClientMercenaryClanActorComponent vtable 0x55BE900: +0x180/+0x188/+0x1C8 = 0x359B50 (ret); +0x1F0 = 0x9E6C60. No list-membership or teleport-home hook was found in the client apply 0x9E46F0. The chart handlers are not decoded, which is why this item is only medium.
+- [high] The safe-spot teleport can be suppressed for the plugin's own Dismiss only. The pointer to 0x2B98E20 exists exactly once, in server clan vtable slot 0x5B2C848 (VT_SERVER_CLAN+0x180). The prologue AOB of 0x2B98E20 is not unique (3 hits), so patch the slot rather than hooking by AOB.
+    Pointer scan: the only reference to 0x2B98E20 is 0x5B2C848; there is no direct E8 call. The plugin's rescue calls SAFE_SPOT 0x2B97DF0 and TELEPORT 0x2BCD120 directly, so it is not affected. AOB 48895C2410 4889742418 55 57 4154 4156 4157 488DAC2470FFFFFF 4881EC90010000 hits 0xD62090, 0x2B98E20 and 0x3668070.
+ACTIONS:
+ - IMMEDIATE (user, no rebuild, unverified): while playing Damiane, make the party list empty, then switch to Kliff. Open the companion quick slot and Disband Oongka. The game's own rule then removes the controlled character's own entry when it is the only one left (0x2151CB7..0x2151DD9), and with an empty list the NotAccompanying rule does not apply. If an entry such as a horse stays in the list, it still blocks. The quick slot's Call check (0x17EC440 -> 0x17ECB50 with flag 0) skips NotAccompanying, so if the screen offers Kliff as a call target, calling him should also unblock the switch.
+ - FIX 1, game.cpp, new pump step 'KeepOwnerListed(Context* c)' on the server thread in PumpHeld/WatchList, owner lock not held: ownerIdx = R16(R64(R64(c->owner+0x68)+0x20)+0x30); ownerKey = CharKeyOfActor(c->owner); ReadClan(c); if (c->control && c->control != c->owner && g_listCount > 0 && !EntryOf(ownerIdx) && g_remembered == 0 && !R8(R64(R64(c->owner+0x68)+0x20)+0x273)) { InlineVec32 keys={keys.inl,1,4,{ownerKey}}; InlineVec64 pairs={pairs.inl,0,4}; VecRef k={&keys,0}, p={&pairs,0}; uint32_t err=~0u; g_accompany(c->clan,&err,&k,&p); Log(...); ReadClan(c); }. Run it at most once per list signature, using WatchList's sig, so a failure cannot loop. Expected: an entry {Kliff idx, owner actor, type 2, mercNo FFFFFFFFFFFFFFFF} appears and the switch to Kliff works.
+ - FIX 2, Register (~line 597): when c->controlKey != owner's key, pass keys {c->controlKey, ownerKey, comradeKey} (count 3, cap 4), so recruiting while you play Damiane keeps Kliff switchable. Recover uses Register, so it is covered too.
+ - PROBE (log-only, behind GC_RESEARCH): MinHook on CanChangeFocusActor 0x17EC980. The AOB is unique: 48895C2410 4889742418 57 4883EC20 488B01 498BF0 8BDA 488BF9 FF9078010000. Signature: typedef bool (__fastcall* CanSwitchFn)(uintptr_t focusActor, uint32_t targetKey, uint16_t* outMsg). After calling the original, inside SEH, log thread side (TLS+0x1EC), R32(focusActor+0x60), targetKey, the result and *outMsg. Map *outMsg to a name by comparing it with R16(mgr+off) for off 0xCC..0xEE step 2, where mgr = R64(R64(R64(R64(base + (side ? 0x6D69530 : 0x6D69528))) + 8) + 0x1C0), using the name table in the findings. No game calls inside the detour. Rate-limit to state changes. If needed, the target check 0x17ECB50 has a unique AOB: 48895C2410 44884C2420 48894C2408 55 56 57 4154 4155 4156 4157 488D6C24D9 4881ECE0000000 4D8BF8 8BDA 4533E4.
+ - TEST: build with WatchList (already in source), the probe and FIX 1 disabled by an ini switch. Call Damiane/Oongka as Kliff, switch to Damiane, try Kliff. The log should show the list with no Kliff entry and the probe 'target 000001 -> 0 NotAccompanying'. Enable FIX 1, see the owner entry come back, and switch. Also repeat once without the plugin (asi renamed) on the same save, to learn whether vanilla drops Kliff's entry by itself.
+ - DISMISS (walk home), part a: wrap the plugin's own g_removeAccompany in DismissHeld (~line 1751) with a slot detour on VT_SERVER_CLAN+0x180 = base+0x5B2C848. Patch it once at start with VirtualProtect RW, a compare-and-swap of the pointer, then restore protection; keep the original in g_clanSafeSpot. Detour: static void __fastcall SafeSpotDetour(uintptr_t clan, uintptr_t actor) { if (t_skipSafeSpot && actor && R32(actor+0x60) == t_skipSafeSpot) return; g_clanSafeSpot(clan, actor); }. Set the thread-local t_skipSafeSpot = his actor key just before g_removeAccompany(c->clan,&err,&span,0,0,0,0) and clear it right after (same thread: 0x2151570 calls 0x2152070 synchronously). Keep the existing CALLS checks at CLAN_TELEPORT+0x38/+0xEA/+0x19F/+0x1BA as the build check.
+ - DISMISS part b: after the removal, call Resync(posComp=R64(R64(actor+0x68)+0x1A0), R32(base+ERR_CLIENT_MOVE)). It sends MoveForceNak/ChangeMoveSessionID; the client then restarts his chart (0x206EED0 at 0x9FF48A) and raises OnAi, so his schedule picks up from where he stands. Then restore the 64 m logout distance as today, and log his position every 1 s for 30 s to see him walk.
+ - DISMISS fallback if the slot patch is not wanted: before g_removeAccompany, snapshot his position with WorldPos. After it, Teleport(c, actor, key) to that snapshot using the plugin's own SAFE_SPOT/TELEPORT helper with the centre = the snapshot and no 25 m test, or build the teleport struct with the snapshot directly. Then Resync. He will jump briefly. There is no other server path that removes an entry without the teleport: r9b=1 is hard-coded at 0x2151ED1, and the protected callers also go through 0x2151570.
+ - Do not use DisbandByKeys / vt+0x160 0x2B979F0 (a4=1) for camp comrades: they set the disbanded flag 0x100000 and the unspawn timer 0x80A or an immediate logout (0x2B99050).
+OPEN:
+ - Which game step removed Kliff's owner entry around 16:09:24 (list 3 -> 2), and does vanilla do the same without the plugin? The WatchList build will show the entries and who is played at each change.
+ - Is the 'not accompanying' reason really the one shown in game? The probe on 0x17EC980 confirms it with the reason name. If it shows Groggy (clan+0x88 timer for mercNo -1), AlreadyCall (clan+0xE8) or Target_ImportantQuest (Kliff's AI 0x1F5ABC0), FIX 1 will not help.
+ - With Kliff's owner entry back while you play Damiane, does Kliff's AI follow Damiane cleanly, or does a stage or quest rule (cc+0x340, 'This is %0#'s story.') fight it?
+ - Does Disbanding the last companion while playing Damiane really empty the list in game (the controlled character's own entry rule), or does a horse entry stay?
+ - What is the run-time box size [0x6D08988] used by the safe-spot search 0x2B97DF0? Logging it would confirm the 'up to about 200 m' reading.
+ - After the list removal, with no teleport, does a client-run camp comrade's chart pick his schedule by itself, or is the Resync restart needed? Handler 0x21E and the schedule branch are not decoded.
+===== verify:dismiss
+HOLDS CanChangeFocusActor 0x17EC980(focusActor, targetKey, u16* outMsg) is the shared check. It calls 0x17ECB50(actor,key,outMsg,1) at 0x17ECB18, and so do the quick 
+    Verified. The E8 callers are exactly 4FAA03, 6545D4, 96BB9E, EFAFDF, EFE498 and 294D856. At 0x17EC980 the function first fails with no message when focus vt+0x178 (the playable flag) is false (0x17EC9A2) or when the target is the focus actor itself (0x17EC9BB). It then runs the self check 0x17ED580 and the target check with r9b=1. In the quick slot, 0xEFDD00 with ui+0x17E set takes the index of [[0x6D69190]+0x30]+0x50. The focus actor comes from 0x64F530, which is UserActor+0xD8. One detail: when the check fails, the server pre-check stores eErrCantChangeFocusActor (0x6CF6EC0, at 0x294D863), and the 0x3F5 reply (0x298DA9C..0x298DB2C) carries that error code, not the u16 reason.
+HOLDS The NotAccompanying rule: a non-empty list that lacks the target fails with mgr+0xE6. The rule is skipped only when cc+0x340 is set or the target is WorldObserv
+    Verified at 0x17ED132..0x17ED212. r12 = [rbp+0x67], which is the saved first argument (the focus actor). 0x21522F0 copies clan+0xB8/+0xC0 without filtering, so r10b means count != 0. The scan at 0x17ED1A0 sets al. If flag && r10b && !al, the code writes word [mgr+0xE6]. The +0x10A field is loaded from global 0x6CE8E98 (0x1F3FC08..0x1F3FC84), and that global is set at 0x1C043B from 'WorldObserver'. +0x100 is loaded from 0x6CE8CB8 ('Kliff', 0x1BFE36). The rule is also skipped when the list is empty, and with flag 0 (the Call path 0x17EC7BD xor r9d).
+HOLDS The LocalStringInfoManager init 0x23E0D00 (vtable 0x59B80F8 +0x40) fills slots +0xCC..+0xEE: Wanted, Crime, ActiveSpecialMode, ImportantQuest, Target_ImportantQ
+    Re-decoded independently, and every slot matches. The vtable 0x59B80F8 RTTI is LocalStringInfoManager, and slot +0x40 = 0x23E0D00. One small detail: the +0xD6 string is 'UI_NonSwitchable_Interacting' (0x23E1303), which has no MercenaryQuickSlot prefix. The uses also match: +0xDE goes with cc+0x273 (0x17ED3FD), +0xDC with 0x17F6B00 and with the clan+0x88 timer, and +0xEC with the clan+0xE8 scan.
+REFUTED The other target checks Kliff must pass are listed. Far and Battle are never tested for Kliff, so only NotAccompanying explains 'Damiane and Oongka work, Kliff 
+    The list of checks is mostly right, but the conclusion is refuted. [rsp+0x20] is set from al at 0x17ED1BA, so whenever Kliff IS in the list, the vt+0x230/0x17EC130 test at 0x17ED470 runs, giving Battle (+0xEA) or Far (+0xE4). The current log shows him in the list (see the next claim). Other reasons can also be Kliff-specific: AlreadyCall (his key in clan+0xE8), Groggy (the owner-only clan+0x88 entry with mercNo -1, 0x17ECF40..0x17ECFF5), Target_ImportantQuest (his key in the vt+0x40 list +0x1A0/+0x1B0, or 0x1F5ABC0 returning 0 when his active AI node is not type 0xF/0x17C==9), Dead and Downed. Wanted, ImportantQuest and ActiveSpecialMode are owner-wide, so they would block every target. Some paths fail with no message at all: 0x17ECB99, 0x17ECBB2, 0x17ED0E6.
+HOLDS 0x214A650(clan, old, new) runs from SetControlActor on both sides. If the new character is not in the list, it disbands every entry; otherwise, if the old one i
+    Verified. The function returns early if either cc+0x340 is set. Entries are collected only when the new character is missing AND the list is non-empty (0x214A6E1..0x214A77B), and then 0x2151570(...,r9b=1,0,0,0) runs at 0x214A7F1. Otherwise, when the old character is missing (this includes an empty list), 0x2152070(clan,old,1,1) runs at 0x214A80F. 0x2152070 returns for playable actors at 0x21520D5. RemoveAccompany skips them at 0x2151EC5, but still removes their list entries. Call chain verified: 0x17EAB5C, 0x206AEC0 is called from 0x28F92F7, and vt+0x178 = byte [actor+0x94] (0x8A67D0).
+REFUTED What removed Kliff's entry is not established. AccompanyMercenary sends the whole server list to the client, so a client/server mismatch is ruled out. The runni
+    The current log refutes the premise. GreymaneCompanions.log (game folder, 16:20:03..16:30:18) comes from a build WITH WatchList. Every dump there contains {000001, index 0, A0100001, type 2, mercenary FFFFFFFFFFFFFFFF}, and the control goes back to 000001 five times (16:21:58, 16:22:01, 16:25:20, 16:25:23, 16:25:30). Only the 16:02 session (the .previous.log) predates WatchList, and its counts fit Kliff being present: list 2 -> call 2 -> 4 -> dismiss -> 3 -> Max -> 4. A mismatch is not ruled out either. The full send happens only on AccompanyMercenary (vt+0x158 0x2B98D10). RemoveAccompany updates the client through vt+0x178 = 0x2B98D90, which is a protected stub whose packet is unknown, and 0x214A650 runs separately on each side at every switch. Also: both .asi files were rewritten at 16:34:25 with no newer log, so it is unknown which build the running game has.
+REFUTED Latent plugin bug: Register passes {controlKey, comrade}. While playing Damiane this would add Damiane and the comrade but never Kliff, leaving exactly the bloc
+    The mechanism is verified: rsi = [clan+8], the owner key is compared at 0x2150C65..0x2150C70, and the owner entry is {idx,[owner+0x60],2,-1}. The conclusion is overstated. AccompanyMercenary merges: it appends only missing indexes (0x2150EE0..0x2150F4F) and never removes Kliff's entry, so the plugin can only fail to re-add him, not drop him. Vanilla's own call handler 0x293DDE0 also builds its keys from the comrades plus the CONTROL actor's index ([[r13+0x30]+0xA0]+0xD8, 0x293DE2E..0x293DE4C), so this is the same as vanilla, not a plugin-specific bug. Every Register in both logs ran while playing Kliff (Register is at game.cpp:610).
+HOLDS Re-adding Kliff with AccompanyMercenary(clan,&err,{ownerKey}) from the pump is safe. It clears the pending list (so wait while remembered != 0), re-arms him thr
+    The mechanism is verified, but the safety is only partly shown. When keys are given, 0x2150A59 sets clan+0xF0 = 0. vt+0x150 = 0x2B98830, and when the actor is found it calls 0x21514A0 and then the next entry (0x2B9892A..0x2B9894A). 0x21514A0 clears 0x100000 and zeroes AI +0xD8/+0xE8/+0x118 under the actor lock. vt+0x158 sends the list. The pairs skip matches the control actor's index (0x2151070..0x2151085), so Kliff will appear in the 'new' pairs. The owner key always takes the owner path, so this call cannot abort with eErrNoInvalidMercenaryData. Not shown: that it is harmless when Kliff is AI-driven or in a scripted state, since his follow fields are reset.
+ACTION REVIEW: I couldn't confirm that the switch is blocked at all. The newest log is E:\SteamLibrary\steamapps\common\Crimson Desert\bin64\GreymaneCompanions\GreymaneCompanions.log (16:20:03..16:30:18, a build with WatchList). It lists Kliff's owner entry in every dump and shows five switches back to Kliff that worked (Damiane->Kliff and Oongka->Kliff at 16:21:58, 16:22:01, 16:25:20, 16:25:23, 16:25:30). The older .previous.log has no list entries, and its counts fit Kliff being present. GreymaneCompanions.asi and PartyHUD.asi were rewritten at 16:34:25, but there is no newer log, so it is unknown which build the running game has.
+
+Cheapest first step: ask the user which message the game shows when the switch to Kliff fails. Each reason has its own UI_*NonSwitchable_* text, and Far, Battle, NotAccompanying, AlreadyCall and Target_ImportantQuest can all block Kliff only. Do no FIX until the probe or that message confirms NotAccompanying.
+
+IMMEDIATE: Low risk, since it only uses the game's own UI. If Oongka is disbanded and the only entry left is the one for the character being played, that entry is removed too (0x2151CB7..0x2151DD9). Playable actors skip 0x2152070, and switching with an empty list only calls 0x2152070 on the old character, which is also skipped. But it helps only if the reason really is NotAccompanying. The quick slot may not offer Disband for a playable character. If the message says Far, walk Damiane back to Kliff instead.
+
+FIX 1: The mechanism is right and the entry has the vanilla shape, so I see no save-format risk. Thread and lock use match Register. The risk is behavioural: it is a global watchdog. Vanilla's own call handler (0x293DDE0) passes the control actor's key, so playing Damiane from an empty list never contains Kliff even in vanilla, and quest segments may rely on that. FIX 1 would force him in, and its re-arm (0x21514A0) resets his follow fields while he is AI-driven. 'Once per signature' still fires again on every add or remove. Better: trigger it only from the plugin's own actions or from a hotkey, and only after the probe shows NotAccompanying. The code sketch matches the plugin's structs (InlineVec32 {data,count,cap,inl[4]}, VecRef {a,b}).
+
+FIX 2: Departs from vanilla. It adds little, because every Register in both logs ran while playing Kliff. Mechanically it is fine: AccompanyMercenary skips indexes already in the list, and the owner key cannot make the call abort.
+
+PROBE: OK. 0x17EC980 is a normal function, not a protected stub, 
+===== verify:switch
+HOLDS Client request path: the UI predicate 0x17EC980, then 0x4FA8A0, then 0x8F0 StartChangeFocusActorReq sent by 0xB6E0A0. 0x7797F0 then sends 0xA9A through 0xB6DDE0
+    Checked. Callers: 0xB6E0A0 is called only from 0x4FAEA8, 0xB6DDE0 only from 0x779B57, and 0x17EC980 from 0x4FAA03, 0x6545D4, 0x96BB9E, 0xEFAFDF, 0xEFE498 and 0x294D856. Packet layout: u16 id at +0, u8 at +2, u16 length at +3, data at +5. For 0x8F0 the data is u32 target then u8 force. For 0xA9A it is u32, u32, u32, 12 bytes, 12 bytes, u8, u8. Force is at [R+0x30], so it is the 6th argument, and there is also a 7th u8 at [R+0x38].
+
+Gap: 0x4FA8A0 can refuse in ways the predicate never sees, and none of them sends a packet:
+- without force, byte [[[base+0x6D69190]+0x60]+0x15C] in 1..0x17 gives eErrCantChangeFocusActor (0x4FA9DE);
+- when the target is the owner (Kliff), it looks up the client actor [clientOwner+0x60] with 0x8AE940; if that actor is not loaded on the client the result is eErrNoInvalidFocusActorKey 0x6CF6EB8 (0x4FABFA);
+- an invalid mercenary record gives eErrNoInvalidMercenaryData (0x4FAEC0);
+- target equal to the control character returns err 0 with no packet.
+Also, the UI path 0x654AE0 calls 0x17ECB50 directly, so it bypasses 0x17EC980.
+HOLDS Server 0x8F0 path 0x294D5B0(charHolderComp, &err, targetKey, u8 force): fails with NotFoundFocusActor if there is no control character; without force fails with
+    Checked: 0x294D64B, 0x294D755 [r14+0xC3], 0x294D856, the owner test at 0x294D9C5, the writes at 0x294DB84 and 0x294DB99, the 0xBBA writes in 0x298AC90, and 0x219D95C setting +0xC3 back to 1.
+
+Corrections:
+- The flag is the value 0x04 (`or byte [..+0x398], 4`), which is bit 2. Code that tests 1<<4 is wrong.
+- There is an earlier failure, eErrNoInvalidField 0x6CF6B54, when there is no field.
+- On the owner path, the vt+0xC0 result only decides whether the target also gets the 0x04 flag; it never fails.
+- The handler 0x298D940 does not put this function's error in its out parameter. The error goes to a local and reaches the client as TrocTrNak 0x3F5, and the handler sets *out to 0 (see the action review).
+HOLDS Server 0xA9A path: 0x294C610 sets a summon flag when the target is not in clan+0xB8, forced off by the control character's cc+0x340 or the special index +0x10A;
+    Checked:
+- the list scan at 0x294D316, which runs only when the byte of the 8th argument ([rsp+0x428]) is 0;
+- the cc+0x340 test at 0x294D363 ([rsp+0x60] is the control actor from 0x206AE30);
+- the +0x10A test at 0x294D39F (the TLS+0x1EC byte, when non-zero, selects 0x6D69530, the server);
+- 0x28F844F giving EC0;
+- the owner path 0x28F85E0..0x28F8605 to 0x28F8DD0, giving eErrNoFailToSummonMercenary 0x6CF6F68;
+- the sites at 0x28F86BC, 0x28F8BA5, 0x28F9242, 0x28F92F7 and 0x28F953B.
+Simplified in the claim: other paths also set the flag (0x294CDFC, 0x294D2A0, 0x294D2B8), but the special-index and +0x340 overrides come after them. The error ends in a local of 0x298D490 and goes out as TrocTrNak 0x3F5; the handler's *out is set to 0 (0x298D7F1).
+HOLDS Shared target check 0x17ECB50 with the refusal slots T+0xD4/DC/CC/D2/D0/EC/E6/E8/DE/EA/E4; G is 0x6D69528 on the client and 0x6D69530 on the server; vt+0x230 is
+    Every branch was checked against the dump. Static RTTI: ClientActor vtable 0x55860F0 slot +0x230 is 0x4FAF30. ServerActor vtable 0x5B1E740 and ServerNormalInGameActor 0x5B1DE20 slot +0x230 is 0x359BA0 (`xor al,al; ret`).
+
+Additions:
+- If the target's actor is not found on that side, the check returns TRUE (0x17ED31E to 0x17ED548).
+- The owner cooldown needs active byte +8 and merc == -1. The mercenary cooldown does not test the active byte.
+- 0x1F5ABC0 returns false (giving D4) when the AI's current node has vt+0x2A8 true and is not (type 0xF with +0x17C == 9).
+- The wrapper 0x17EC980 adds refusals that depend only on the control character: vt+0x178 (ctrl+0x94 on the server, or user match plus +0x94 on the client); state 0x108 giving D8/DA/DE/E0 (the vehicle and dead errors); 0x17ED580 giving CC/CE/D2. It returns false with msg left at 0xFFFF when the target is the control character.
+REFUTED The special index at +0x10A is very likely Kliff, so Kliff is exempt from the party rule and the distance rule and always takes the in-party path.
+    How the exemption works is confirmed: at 0x17ED14C it jumps to 0x17ED2D1 with [rsp+0x20] still 0, so both E6 and the vt+0x230 distance test are skipped, and 0x294D39F forces the swap path. That the index is Kliff is NOT shown. It is runtime data, and the argument that vanilla would otherwise be broken is only an inference.
+
+It also does not decide the reported case. Kliff was in the server list (recruited as {Kliff, Luceran}, and the re-apply gave list 4), so E6 cannot explain the bug either way. If the index is NOT Kliff, the client distance rule (EA/E4) does apply to a non-controlled Kliff who was left behind, and that stays a live suspect. DIAG-1 must read the value.
+HOLDS Refuted: a stale actor key in Kliff's entry cannot break the switch; the switch code finds no actor through the accompany list; Kliff's entry is in vanilla form
+    In 0x4FA8A0, 0x17ECB50, 0x294C610, 0x294D5B0 and 0x28F82A0 the list is only read at 0x4FAB56, 0x17ED1A6 and 0x294D316, and only for the u16 index. Kliff's actor comes from [owner+0x60] (0x17ED0A9, 0x4FAAEB). AccompanyMercenary writes {idx, [owner+0x60], 2, -1} (0x2150C4C..0x2150CC7). 0x206AEC0 changes only user+0xD8 and the +0x94 flags.
+
+Caveat (affects things indirectly): the 0x9FB client handler drops the WHOLE list update if any entry has index 0xFFFF or actor 0 (0xBEC2D0..0xBEC2D9). An entry with actor 0, in any slot, therefore leaves the client's list and its remembered count stale, and the client predicate (E6, EC) then works from old data. A stale non-zero key passes that test.
+HOLDS Vanilla leader entry: 0x293DDE0 appends the control character's key (a leader entry only when that is the owner); the re-apply 0x2BC9B70 passes no keys; an expl
+    Checked:
+- 0x293DE2E..0x293DF36: the keys found by 0x2049B90, plus the control character's key with duplicates removed.
+- 0x2150A59 clears +0xF0 when the key count is non-zero; with no keys it uses the remembered list, or fails with NoEmptyCalledMercenaryList.
+- The remembered keys are used up in 0x2150F52..0x2150FAA; a count of exactly 1 is zeroed.
+- 0x2151070..0x2151085 skip the control character's index.
+- The client: 0x9E472C zeroes +0xF0 and +0xC0, then copies the list.
+
+Also relevant:
+- Any non-owner key without a valid record aborts the whole call with eErrNoInvalidMercenaryData (0x2150CE7), and the remembered list is left intact. A failed re-apply therefore leaves keys stuck in the remembered list, which gives EC refusals for those characters.
+- vt+0x150 (0x2B98830) receives the CONTROL actor (0x215101D) and the complete key list.
+REFUTED RemoveAccompany removes the control character's own entry when it is the last one left, then runs 0x2152070 on the control character with r9b=1 (safe-spot telep
+    The list part holds: when count==1 and the index matches at 0x2151CB7..0x2151DD9, the entry is removed, clan vt+0x1F0 runs when the list is empty, and a6 ([rbp+0xA8]) clears +0xF0 at 0x2151E01.
+
+The teleport part is REFUTED. The loop at 0x2151EB6..0x2151ECF calls actor vt+0x178 (on the server, 0x8A67D0 returns byte actor+0x94) and skips 0x2152070 when it is set. 0x206AEC0 sets +0x94 to 1 on the new control character (0x206B1FA) and clears it on the old one (0x206AFE8). 0x2152070 itself also returns early when vt+0x178 is true (0x21520D5) and when the control character's cc+0x340 is set. The player's character is therefore never moved; only its leader entry goes.
+
+This also has nothing to do with the bug: dismissing Luceran from a list of 4 never triggers the last-entry rule, and Kliff could not be selected before the dismiss either.
+ACTION REVIEW: SUMMARY
+The research largely holds. Two things are wrong and change the plan:
+- DIAG-0 as written cannot see a server-side refusal.
+- RemoveAccompany never teleports the player's character, so PLUGIN-3's warning is wrong.
+Kliff was in the server list, so the "Kliff's entry is missing" theory behind REPAIR and PLUGIN-1 is unlikely. Diagnose before repairing anything.
+
+SUSPECTS LEFT FOR "Damiane and Oongka work, Kliff does not"
+1. Client distance rule EA/E4: applies if +0x10A is not Kliff. Nothing makes a Kliff who is not being played follow the party.
+2. Kliff's actor is not loaded on the client: eErrNoInvalidFocusActorKey at 0x4FABFA. No packet is sent, and the predicate never sees it.
+3. EC: Kliff's key is stuck in the client's or the server's remembered list. This happens after a failed re-apply, or when the client dropped a 0x9FB update because one entry had actor 0 or index 0xFFFF (0xBEC2D0).
+4. D4 / DE / DC on Kliff:
+   - D4: his AI is busy (0x1F5ABC0), or he is on a block list.
+   - DE: he is downed.
+   - DC: an owner cooldown entry with merc -1.
+5. Server owner path: owner->vt+0xC0(4,0x10) fails, giving eErrNoFailToSummonMercenary (0x28F8DDB).
+
+FREE CHECKS FIRST (no code)
+- Ask the user what message appears on screen when the Kliff switch fails. The slot strings point to the branch.
+- Ask the user to try the switch while standing next to Kliff. If it works there, the cause is suspect 1 or 2.
+- Repeat the sequence with the plugin removed: call Damiane and Oongka, switch to Damiane, switch back.
+
+DIAG-0
+Safe: it runs on the server thread and only reads.
+Flaw: "log *out" is useless.
+- The dispatcher 0x2773C20 writes [r12]=edi=0 on every path (for example 0x27742E0).
+- The handlers 0x298D940 and 0x298D490 set *out to 0. The errors from 0x294D5B0 and 0x294C610 go to locals and are sent as TrocTrNak 0x3F5.
+Fix:
+- Add log-only MinHook detours on 0x294D5B0 and 0x294C610. Both start with a normal prologue, not a stub. Arguments: rcx = cc, rdx = u32* err, r8d = target. Call the original, then log *rdx with ErrorText.
+- Read the payload before calling the original. Check the length R16(d+3): at least 5 for 0x8F0, at least 0x24 for 0xA9A.
+- Keep the inference "no 0x8F0 seen = the client refused".
+
+DIAG-1
+OK, with three fixes:
+- The cc+0x398 flag is the value 0x04, not 1<<4.
+- 0x1416B80 is a plain clock read. It is safe to call, but it is a game call.
+- The client copies are written by the client thread. Read them only under __try, never take their locks, and ex

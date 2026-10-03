@@ -1,0 +1,313 @@
+===== dismiss
+SUMMARY:
+Dismiss needs a new data prompt and a small plugin step together. Data alone cannot remove her from the accompany list, and the vanilla Disband call is the wrong tool for a camp comrade.
+
+(1) Why vanilla Disband is hidden. Npc_Order_Disband 0xF425B has no CheckAccompanyType at all. It needs two things a followed comrade never has:
+- the player carrying the buff tag 0xC10DC139 (stored only in skill 11192 "Passive_FollowPlayer");
+- CheckSameParty: she must be in the same Party as the player. The accompany list never adds her to a Party.
+So it is an order for Party/escort followers, not for the accompany list.
+
+How vanilla Disband works:
+- Client: the mercenary quick-slot UI 0xEFD810 -> 0x6508A0 -> client clan 0x9DCC40 -> TrocTrDisbandMercenaryReq (packet 0x9C7).
+- Server: handler 0x2A33000 -> DisbandByKeys 0x2BA10A0 -> 0x2151570 (flags 1,0,0,0).
+- Because the first flag is 1, the game also sets her 0x100000 flag and queues an "unspawn" timer, ending in the game's logout 0x2068340. So vanilla Disband despawns her. She does not walk home.
+
+The comrade charts' Disband event handler 0x21E is still not decoded. No AI function can remove a list entry anyway, so the event alone does nothing to the list.
+
+(2) Recommended design: a data clone plus a plugin hook (your options a and b together).
+- Data: a cloned prompt, "Npc_Order_Dismiss" 0xF5010, built from Npc_Order_Wait.
+  - Label: the game's own "Dismiss" text, or "Disband" as the safe fallback.
+  - Shows whenever she is in the list, any type (1 to 4).
+  - Sends no AI event. Uses Follow's prompt key so it does not share Standby's.
+  - It replaces Npc_Order_Disband in Test 3's comrade lists.
+- Plugin: hook TryPreempt 0x2B36EF0 to catch the clone and queue it.
+- Pump: remove her with 0x2151570(clan, &err, &{&idx,1,1}, 0,0,0,0), the same flags the game itself uses at 0x2BAEB00. Then restore her logout distance and stop looking after her.
+  - Result: she is off the list and the client is told, the same way vanilla Disband does it. She stays hired. No disbanded flag is set and she is not unspawned.
+  - Only for a summoned copy (spawn type 0xE) use DisbandByKeys, the vanilla unsummon, as for Damiane.
+- Option c (forcing vanilla Disband visible with a hook on 0x21206C0) is rejected: it still removes nothing and sends the undecoded event.
+
+(3) Whether she goes back to her routine by herself cannot be settled statically. Evidence that she should:
+- AI charts test list membership (AICondition_CheckAccompany scans clan+0xB8).
+- Aldric stayed on his camp schedule while he was in the list, as long as no Follow event was sent.
+- The 0x100000 flag only filters AI events; it does not drive behaviour.
+
+For her, the client copy of the list must update; that goes through the same protected sync vanilla uses. If she was dismissed far from camp, the restored logout distance lets the game's clean-up log her out, and the camp should spawn her again (not verified).
+
+Fallbacks if she keeps following: a clone variant that sends the Standby or Disband event, or DisbandByKeys as a last resort.
+
+About your note on the knowledge entry already showing their picture: that belongs to the HUD portrait work and was not covered in this run.
+
+FINDINGS:
+- [high] Npc_Order_Disband 0xF425B: exact condition list.
+  Record length 396. u32 count = 1 at +0x103, then the 'present' byte at +0x107.
+- Player logic (from +0x108): ((Macro IntroComplete 0xF4252 && Macro InteractionDefault 0xF4241) && CheckBuffTag(0xC10DC139)).
+  - CheckBuffTag leaf: bytes 03 02 01 at +0x119, tag bytes 39 C1 0D C1 at +0x11C, actor byte 00 at +0x120, trailer 00 00 01.
+- Target logic (from +0x124): (((!CheckDead && CheckSameParty) && !CheckCCTime) && Macro InteractionTarget_Hello 0xF4257).
+  - CheckSameParty leaf: 03 31 00 00 at +0x12E.
+  - Macro leaf: 03 09 01 57 42 0F 00 at +0x137.
+- No CheckAccompanyType (type 0x197) anywhere in the record.
+- AI event key 0x8EC9E12C at +0xC7.
+- Prompt key hash 0x558AE419 at +0x14F. The same value is in 190 records, including Npc_Talk_*.
+- Decoded with gc\condparse.py; the dump is in gca\wf4\ii_hex.txt.
+- [high] Why Disband is hidden on an accompany-list comrade: both CheckSameParty and CheckBuffTag fail. Disband is the Party/escort-follower order.
+  CheckSameParty:
+- Vtable 0x595D558; its evaluate slot +0xA8 is 0x22586F0.
+- It takes the PartyAttacher (vtable 0x5916598) for ctx+0x828 and ctx+0x830 through 0x1801590 and reads the party id at [attacher+0xB0].
+- It passes only if both ids have bit 41 set and the ids are equal (0x2258774..0x2258792). Otherwise it returns 1.
+- AccompanyMercenary 0x2150930 never joins her to a Party. Party joining is a separate path: the OnParty_Join handler 0x19D and AIFunction_PartyJoin 0xC8.
+
+CheckBuffTag:
+- Vtable 0x5956F50; its evaluate slot +0xA8 is 0x22803E0.
+- It walks the player's buffs: [[subject+0x68]+0xF0]+0x58, count at +0x60, stride 0x150.
+- It passes if 0x21E9280(buff)+0x10 equals the tag (0x228041F..0x2280443).
+- A scan of all tables finds tag 0xC10DC139 only in skill 11192 'Passive_FollowPlayer' (+0x2F) and in Npc_Order_Disband (+0x11C).
+- [high] Vanilla Disband flow, client to server.
+  Client side:
+- UIGamePlayControlMercenaryQuickSlot: vtable 0x56B2158, slot +0x5A0 = 0xEFD810.
+- With action dl==4 it calls 0x6508A0(.., u32* err, u16 idx) at 0xEFD949.
+- 0x6508A0 gets the client clan [[user+0x68]+0x110] and calls 0x9DCC40 at 0x650A2B.
+- 0x9DCC40 calls BE3870 at 0x9DCEB2, which builds TrocTrDisbandMercenaryReq (packet 0x9C7, vtable 0x5B228B8). Payload: a u8 at +5, then u32 character keys.
+- The stage dismissal popup 0x5CE030 also reaches the client clan's vt+0x160, which is 0x9DCC40.
+
+Server side:
+- Handler 0x2A33000 checks the sender: [[a+0x88]+1]==1 and [a+0x96]!=0 (0x2A33225..0x2A33239).
+- It calls DisbandByKeys 0x2BA10A0([[a+0x68]+0x110], &err, &span) at 0x2A33251.
+- On error it sends the fail ack through 0x2A2CA00 at 0x2A33298.
+- DisbandByKeys calls 0x2151570(clan, err, &Span16, a4=1, a5=0, a6=0, a7=0) at 0x2BA1265..0x2BA1273.
+- [high] DisbandByKeys despawns a comrade (unsummon and logout). She does not walk back.
+  - 0x2151570 passes a4 ([rbp+0x98], loaded at 0x2151E80) to 0x2152070(clan, actor, a4, 1) at 0x2151ED1..0x2151EDF.
+- 0x2152070 with a=1:
+  - sets cc flag 0x100000 through 0x1795490 (0x215218F..0x21521A8);
+  - calls clan vt+0x188 = 0x2B99050 (0x21521B6);
+  - calls vt+0x180 = 0x2B98E20, a teleport to a safe spot (0x21521CA);
+  - calls vt+0x1C8 = 0x2B9A390 only if she is dead or downed (0x21521F8..0x2152234).
+- 0x2B99050 then does one of two things:
+  - posts TrocTrProcessUnspawnMercenaryOnceTimer 0x80A {0xFF, mercNo} through 0x2B8FB10 (0x2B8FB45..0x2B8FBE9);
+  - or, if her mercenary leader key differs from the owner's key, logs her out at once: 0x2068340(actor, .., 0x58, eErrNoUserRequestToLogout) at 0x2B9912A.
+- Timer handler 0x2C34820 -> 0x2B8FC20 -> 0x2B8E440, which carries the string 'pa::ServerMercenaryClanActorComponent::unsummonMercenarySummonStateWithCost'. It:
+  - updates the database ('sql->updateMercenaryDeadTime');
+  - saves her position into record+0xC8..+0xD8;
+  - adds the record to the clan+0x118 list;
+  - logs her out with reason 0x58 at 0x2B8EB2C.
+- The unsummon check 0x2152570 (summon=0) fails if record+0xDD==0 (eErrNoMercenaryCanBeUseAfterInitialize) or if she is downed (eErrNoFailToUnSummonMercenary).
+- [high] 0x2151570 with a4=0 removes her from the list without the disbanded flag and without the unspawn. The game itself uses this form.
+  What each argument does in 0x2151570:
+- a4 [rbp+0x98] is used only as 0x2152070's r8b (0x2151E80/0x2151ED4).
+- a5 [rbp+0xA0] raises game event 0x54 (0x2151F1B..0x2151F80).
+- a6 [rbp+0xA8] marks the list for sync and clears clan+0xF0, and is passed to vt+0x178 (0x215179E, 0x2151DF8, 0x2151FC3).
+- a7 [rbp+0xB0] calls vt+0x168 (a no-op on the server) and is passed to vt+0x178.
+
+Other facts:
+- Server clan vt+0x1A0 = 0x2BAEB00 calls it with (r9=0, 0, 0, 0) at 0x2BAEBFC..0x2BAEC1A.
+- The client sync is the same as Disband's: clan->vt[0x178] = protected 0x2B98D90 at 0x2151FCD, run whenever the key list is not empty.
+- The entry is swap-removed at 0x2151C20..0x2151C91.
+- Errors: NotFoundFocusActor 0x6CF6EBC (0x21515D1), NoInvalidMercenaryData 0x6CF6F50 (0x2151828/0x2151A4E), 0 = ok (0x2151FDA).
+- It takes the owner's exclusive lock 0x393650 at 0x21517CA.
+- It allocates from the TLS+0x1FD heap, so it must run on a server thread.
+- If only the control actor's own entry is left, that entry is removed too (0x2151CB7..0x2151DD9).
+- AOB unique: 44 88 4C 24 20 4C 89 44 24 18 48 89 54 24 10 55 53 56 57 41 54 41 55 41 56 41 57 48 8D 6C 24 C8 48 81 EC 38 01 00 00. It is also the target of the E8 at 0x2BA1273 and at 0x2BAEC1A.
+- [high] A data-only Dismiss is impossible. No interaction or AI function can remove an accompany entry.
+  - The remover 0x2151570 has only 5 call sites: 0x214A7F1, 0x2B97A0B (clan vt+0x160), 0x2B987B5 (0x2B98600, called from stage code at 0x2948xxx), 0x2BA1273 (DisbandByKeys) and 0x2BAEC1A (vt+0x1A0).
+- AIFunction_SetAccompanyType (vtable 0x59733A8; execute 0x22FBB80 calls slot 0x290 = 0x2AC9270) only calls the type setter 0x21523A0 (at 0x2AC936C).
+- The full AIFunction list has FireMercenary 0xE5, PartyLeave 0xC6, PartyJoin 0xC8 and SetAccompanyType 0x10C, and nothing that removes an entry.
+- An interaction can only raise AI events (pivot+0x64 / +0x68), hand out drop sets, dialogs or menus.
+- The step machine skips the raise when the event key is 0 (0x211DDD9..0x211DDDE). Mercenary_Heal has event 0, a working precedent.
+- [medium] What the comrade charts' OnParty_Command_Disband handler 0x21E does is not decoded.
+  - In Morrow's chart (hash 0xA17A8F3E) the event table entry is '01 2C E1 C9 8E 07 00 00 00 1E 02 00 00', near pai offset 0x313177. All 34 mercenary charts point this event to 0x21E.
+- Handler values index pooled objects in aichart.pai: the file header holds per-type pool counts from +0x6C. The bodies were not decoded, the same result as the earlier gc research.
+- By the previous finding, it cannot remove the list entry. Whether it calls FireMercenary (0xE5) or PartyLeave (0xC6) is unknown. That is why the clone sends no event.
+- [low] After a soft removal she most likely drops follow mode by herself. This is not proven.
+  - AICondition_CheckAccompany 0x22EA740 -> 0x17EC1B0 scans clan+0xB8 (0x17EC25C..0x17EC27F). Charts can test list membership live.
+- Aldric (in the list as type 2, flag cleared, no Follow event) kept his camp schedule (experiment 2). So her routine does not need 0x100000.
+- 0x100000 only filters AI events: OnInitialize, OnAi and OnFocusCharacterStart/End are let through (0x2074D48..0x2074DA3).
+- At spawn the game sets 0x100000 on owned comrades that are not in the list (0x205A735..0x205A752).
+- 0x2152070 resets the AI (0x206EED0) only when owner->vt[0x188](5) is true (0x215214C..0x2152185). That is never the case for the player's clan.
+- For a client-run AI (actor+0x90 = the user key, as for Matilda and Max), the client list must update through protected vt+0x178. The client applies it in handler 0xBEC480 -> protected 0x9E4840 (at 0xBEC7DF).
+- [high] The clone was built and checked: three variants from Npc_Order_Wait 0xF4253.
+  gca\wf4\build_dismiss.py decodes the result with condparse.
+- Variant A (378 bytes): label 'Disband'; condition (!CheckDead && !CheckAccompanyType(None)) && !CheckCCTime; event dword at +0xC4 = 0; condition count at +0x100; prompt key hash 0xFC15F4E2 at +0x13D.
+- Variant B (381 bytes): label 'Dismiss'; event at +0xC7; prompt key at +0x140.
+- Variant C: Wait's own 2||3 conditions.
+- CheckAccompanyType 0x22A4E80 returns 2 with no leader (0x22A4EEE/0x22A4F59) and 0 when the type equals its argument (0x22A4F89). So Not(Acc==None) passes only when she is in the list.
+- Interaction keys end at 0xF4391, so 0xF5010 is free.
+- [medium] The game's own 'Dismiss' and 'Disband' texts are available.
+  - localstringinfo record 0x18E11001 holds the LocString 0B | B0 00 00 00 | 01 10 E1 18 | 13 00 00 00 | '1792731723151179952' = 'Dismiss'.
+- Npc_Order_Disband +0x1E holds 06 | 60 00 00 00 | 5B 42 0F 00 | 10 00 00 00 | '4295083260117088' = 'Disband' (interaction.paloc).
+- The LocString kind byte equals the paloc file's flag: 3 = character, 6 = interaction, 11 = localstringinfo. So a kind-11 label should resolve inside an interaction record (inferred).
+- [medium] Prompt keys: Standby, Follow and Talk each have their own key. While she follows, Follow's key is free.
+  - The 4-byte value after '51 C3' is the prompt key (inferred from how the values group):
+  - 0x5C3952A4: Wait +0x13F (shared with Gift, Threaten, Horse_OpenInventory);
+  - 0xFC15F4E2: Follow +0x143 (shared with Employ and the shops, 77 records);
+  - 0x558AE419: Disband and Talk (190 records).
+- Follow needs type 1 or 3, so at type 2 the clone using 0xFC15F4E2 has no clash.
+- The field name (_inputKeyMapName at InteractionInfo+0x5C) comes from the field order, not a direct decode.
+
+ACTIONS:
+- DATA 1, interactioninfo new_record (DMM v3, the same kind of blob intent build_test.py uses): {'op':'new_record','new_key':0xF5010,'label':'Dismiss','template':{'key':0xF5010,'_blob_fallback':True,'_blob_b64':<dismiss_blobs.json['B_dismiss_label']>}}. Use 'A_disband_label' if the kind-11 label shows empty in game. How it is made from Npc_Order_Wait 0xF4253 (380 bytes):
+  (1) u32 key at +0 -> 0xF5010.
+  (2) string key 0E 00 00 00 'Npc_Order_Wait' -> 11 00 00 00 'Npc_Order_Dismiss'.
+  (3) label LocString at Wait+0x1B '06 60000000 53420F00 10000000 4295048900378720' -> Disband's '06 60000000 5B420F00 10000000 4295083260117088', or Dismiss's '0B B0000000 0110E118 13000000 1792731723151179952'.
+  (4) target tree, 24 bytes '01 01 02 03 10 00 00 00 00 03 97 01 02 00 03 97 01 03 00 02 03 2F 00 00' -> 19 bytes '01 01 02 03 10 00 00 00 02 03 97 01 00 00 02 03 2F 00 00' (visible for types 1-4). Keep the 24 bytes for Standby's 2||3 behaviour.
+  (5) AI event at Wait+0xC1, 9C 07 BE EE -> 00 00 00 00.
+  (6) prompt key at Wait+0x13F, A4 52 39 5C -> E2 F4 15 FC.
+  Everything else is copied: pivot, player macros, trailers. The builder is gca\wf4\build_dismiss.py; the bytes are in dismiss_*.bin.
+- DATA 2, characterinfo: in build_test.py replace 'Npc_Order_Disband' with key 0xF5010 in CAMP_EXTRA and in ORDERS. Add 0xF5010 to KNOWN_INTERACTIONS before add_interactions/interaction_list run, because the list check only accepts known keys. Npc_Order_Disband can never show on an accompany-list comrade, and would send the undecoded event 0x8EC9E12C.
+- PLUGIN 1, new function pointers (plain code; follow the existing build check, prologue memcmp and E8-decoding rules):
+  - RemoveAccompany 0x2151570: typedef uint32_t* (__fastcall*)(uintptr_t clan, uint32_t* err, Span16* idx, uint8_t setDisbandedAndUnspawn, uint8_t raiseEvent, uint8_t clearRemembered, uint8_t a7), with struct Span16 { uint16_t* data; uint32_t count; uint32_t cap; }. Take it from the E8 at 0x2BA1273 inside the already checked DISBAND 0x2BA10A0, or match the AOB 44884C24204C894424184889542410555356574154415541564157488D6C24C84881EC38010000.
+  - Optional SetCharFlag 0x1795490: void(uintptr_t cc, uint32_t flag, uint8_t set, float duration /*xmm3*/, uint8_t second /*[rsp+0x20]*/), from the E8 at 0x21521A8. Never hold an actor lock while calling it.
+  - InteractionInfoByIndex 0x3888B0 (protected stub; call only), from the E8 at 0x2B36FAE.
+- PLUGIN 2, H1 hook TryPreempt 0x2B36EF0 (AOB 48895C2410 6644894C2420 55 56 57 4154 4155 4156 4157 488D6CF9; the only caller is in .xtls, do not hook the stub 0x2B36860):
+  static uint64_t __fastcall HookTryPreempt(uintptr_t self, uint32_t* result, uintptr_t target, uint64_t iidx, uint64_t a5, uint64_t a6, uint64_t a7, uint64_t a8) {
+    uint64_t r = g_tryPreempt(self, result, target, iidx, a5, a6, a7, a8);
+    __try {
+      if (TLS(0x1EC) && result && *result == 0 && target) {
+        uint16_t i = (uint16_t)iidx;
+        if (*(uint32_t*)g_iiByIndex(&i) == 0xF5010)
+          QueuePush(CMD_DISMISS, R32(R64(self + 8) + 0x60), R32(target + 0x60));
+      }
+    } __except (1) {}
+    return r;
+  }
+  Never call clan functions inside it.
+- PLUGIN 3, pump step DismissComrade(c, targetKey), in H0 on the server thread with the owner lock NOT held:
+  (1) actor = findActor(mgr, targetKey); idx = R16(R64(R64(actor+0x68)+0x20)+0x30); key = R32(g_charInfo(&idx)); require key in roster.h and idx != the control actor's idx.
+  (2) uint8_t t; if (!g_getAccompanyType(c->clan, idx, &t)) { log 'not in list'; return; }
+  (3) Comrade* m = Find(key); stop the watchdog for her first: mark her DISMISSED so re-registration (plan 4.2) never fires.
+  (4) if (R8(cc+0x2D0) == 0xE /*a summoned copy*/) Disband(c, key); /* vanilla DisbandByKeys = unsummon, like Damiane */
+      else { uint16_t ix = idx; Span16 s = { &ix, 1, 1 }; uint32_t err = ~0u; g_removeAccompany(c->clan, &err, &s, 0, 0, 0, 0); Log err by name; }
+  (5) ReadClan(c); check that GetAccompanyType now returns false.
+  (6) Release(c, m, "dismissed", now): restores her oldLeash through 0x28FA550 (no actor lock held) and frees the slot.
+  (7) Optional ini switch DismissFlag=0: g_setCharFlag(cc, 0x100000, 1, 0.0f, 0), the camp-comrade state set by 0x205A749.
+  (8) Log her position, distance to the player, cc+0x390|+0x394 flags and spawn type every 1 s for 30 s, to see whether she resumes her routine.
+- TEST in game (test save): talk to a following comrade and pick Dismiss. Expected log: err 0, entry gone, Standby/Follow/Dismiss disappear from her prompts. Then watch:
+  (a) she stops following and walks her camp routine: done;
+  (b) she keeps following: try clone variant 2 with event 0xEEBE079C (OnParty_Command_Wait; a known-safe handler 0x21D) or 0x8EC9E12C (handler 0x21E, on a spare comrade);
+  (c) dismissed more than 64 m from camp: expect the clean-up (0x28F9A20 inside the sweep 0x2C37340) to log her out once the leash is restored. Check that she is back at camp later.
+  Use DisbandByKeys for a world actor only as a last resort: it logs her out through 0x80A -> 0x2B8E440 and writes the 'with cost' bookkeeping.
+
+OPEN:
+- What does handler 0x21E (OnParty_Command_Disband, shared by all 34 mercenary charts) do? It is not decoded. Does it call AIFunction_FireMercenary 0xE5 or PartyLeave 0xC6?
+- Does her chart, client-run for Matilda and Max, leave follow mode once her entry is gone, or does it keep following until an event arrives? This needs the in-game test in action 5.
+- Does the camp spawn a comrade again after a logout, either by the clean-up sweep or by DisbandByKeys' unsummon? Could the 'with cost' bookkeeping (clan+0x118 list, DB dead time, record+0xC8 position, timer 0x81B) delay or block that?
+- Does an interaction prompt display a kind-11 LocString (localstringinfo 'Dismiss')? If not, use variant A ('Disband', kind 6).
+- Is the value after '51 C3' really the prompt key? If 0xFC15F4E2 clashes with anything on comrades, use 0x5C3952A4 (Standby's) or 0x558AE419 (Talk's, as vanilla Disband does).
+- What do protected vt+0x178 0x2B98D90 (the client sync and possibly the remembered list clan+0xE8) and the client apply 0x9E4840 do with a6=0, a7=0? They are the same for vanilla Disband and for the soft removal.
+- Who grants skill 11192 'Passive_FollowPlayer' (the buff tag 0xC10DC139)? Probably escort or Party sequences; not traced.
+- Is record+0xDD set for camp comrades? If it is 0, DisbandByKeys' unsummon fails with eErrNoMercenaryCanBeUseAfterInitialize and she stays.
+- Your relayed note ("their knowledge entry shows their picture already") was not covered by this Dismiss research. It looks like it is for the F11 HUD portrait workstream.
+
+VERDICTS:
+- HOLDS: Npc_Order_Disband 0xF425B: exact condition list.
+  Checked against the table bytes. Record length is 396. Count 1 is at +0x103 and the present byte at +0x107. Player logic at +0x108 is ((Macro F4252 && Macro F4241) && CheckBuffTag): leaf 03 02 01 at +0x119, tag C10DC139 at +0x11C, actor 00 at +0x120, trailer 00 00 01 at +0x121. Target logic at +0x124 is (((!CheckDead && CheckSameParty) && !CheckCCTime) && Macro F4257): CheckSameParty 03 31 00 00 at +0x12E, macro at +0x137. There is no 03 97 01 (CheckAccompanyType) in the record. The AI event 8EC9E12C is at +0xC7. Correction: the u32 at +0x14F is not a prompt key. It is _inputKeyMapName = hashlittle('InteractionX', 810718) = 0x558AE419. The 190-record count is right (51 C3 + key is in 190 records). No vanilla character lists Npc_Order_Disband.
+- REFUTED: Why Disband is hidden on an accompany-list comrade: both CheckSameParty and CheckBuffTag fail. Disband is the Party/escort-follower order.
+  The evaluators are described correctly. CheckSameParty is vtable 0x595D558, slot +0xA8 = 0x22586F0. It returns 2 if ctx+8 != 5, and passes only when both [attacher+0xB0] ids have bit 41 set and are equal (0x2258774..0x2258792). CheckBuffTag is vtable 0x5956F50, slot +0xA8 = 0x22803E0, using [[ctx+0x828]+0x68]+0xF0, +0x58/+0x60, stride 0x150 and 0x21E9280+0x10. Scanning all 134 tables finds the tag only in interactioninfo (Disband) and skill.staticinfobody Passive_FollowPlayer. But 'both fail' is not shown. AccompanyMercenary calls a protected stub, 0x214E7A0 -> .xtls 0xE4B8080 (at 0x2150C7A), so 'never joins a Party' cannot be checked statically. Whether the player carries the tag buff is a runtime question, and the notes record no in-game check of Disband after Follow. At least one of the two fails; which one is not established.
+- HOLDS: Vanilla Disband flow, client to server.
+  Spot-checked: 0xEFD949 calls 0x6508A0; 0x650A2B calls 0x9DCC40 with rcx = [..+0x110]; 0x9DCEB2 calls BE3870. RTTI of 0x5B228B8 is TrocTrDisbandMercenaryReq. Handler checks are at 0x2A33225..0x2A33239. 0x2A33251 calls 0x2BA10A0, and the fail path calls 0x2A2CA00 at 0x2A33298. DisbandByKeys passes r9b=1 and [rsp+0x20/0x28/0x30]=0 at 0x2BA1256..0x2BA1273, i.e. a4=1, a5=a6=a7=0. Not checked: packet id 0x9C7, the payload layout, the dl==4 test, and the 0x5CE030 popup path.
+- HOLDS: DisbandByKeys despawns a comrade (unsummon and logout). She does not walk back.
+  0x2151570 calls 0x2152070(clan, actor, a4, 1) at 0x2151ED1..0x2151EDF. With r8b=1, 0x2152070 sets flag 0x100000 through 0x1795490 (0x215218F..0x21521A8) and calls vt+0x188 = 0x2B99050. Separately, r9b=1 calls vt+0x180 = 0x2B98E20 at 0x21521CA. vt+0x1C8 = 0x2B9A390 runs if 0x1794ED0 is true or cc+0x273 != 0. 0x2B99050 compares [[actor+0x68]+0x118]+0x18 with [clan+8]+0x60: if equal it calls 0x2B8FB10 (0x2B99109), otherwise it logs her out with 0x2068340, r8b=0x58 (0x2B9912A). The chain 0x2C34857 -> 0x2B8FC20 -> 0x2B8FCCE -> 0x2B8E440 ends at r8b=0x58 (0x2B8EB22), and the 'unsummonMercenarySummonStateWithCost' string exists at 0x5B2C377. Caveat: 0x2152070 has early-outs that skip everything (0x21520AE..0x2152124: control cc+0x340, actor vt+0x178, 0x1F5AB60). I did not re-check 0x2152570.
+- HOLDS: 0x2151570 with a4=0 removes her from the list without the disbanded flag and without the unspawn. The game itself uses this form.
+  The core claim is right. [rbp+0x98] is read only at 0x2151E80 (as r8b at 0x2151ED4). a5 is used at 0x2151F1B, a6 at 0x215179E/0x2151DF8/0x2151FC3, a7 at 0x2151F05. The swap-remove is at 0x2151C20..0x2151C91. The sync vt+0x178 = 0x2B98D90 runs when count != 0 or a6. err=0 is set at 0x2151FDA. vt+0x1A0 = 0x2BAEB00 calls with r9=0,0,0,0 (0x2BAEBFC..0x2BAEC1A). The AOB is unique at 0x2151570. Missing from the claim: (1) with a4=0, 0x2152070(clan, actor, 0, 1) still runs the vt+0x180 safe-spot teleport 0x2B98E20, still runs vt+0x1C8 0x2B9A390 when she is downed or dead, and still runs 0x206EED0 on her AI when owner->vt188(5) is true (0x215214C..0x2152185). (2) When her entry becomes empty, vt+0x1F0 is called (0x2151DF2); on the server that slot is 0x359B50 (ret). (3) It also needs a clan record with [rec+0x28] != -1, else err NoInvalidMercenaryData (0x215195B..0x2151A4E). (4) 'Must run on a server thread' is overstated: TLS+0x1FD only picks the allocator (0x21516C4) and the free uses the same test (0x2151FF4). A protected caller at .xtls 0xE4B27F2 also uses the a4=0 form.
+- REFUTED: A data-only Dismiss is impossible. No interaction or AI function can remove an accompany entry.
+  Refuted on the evidence given. A rel32 scan finds 7 E8 calls to 0x2151570, not 5. The two extra calls are in .xtls: 0x9C4FF2F (a4=1, a5=1, a6=r13b, a7=r12b) and 0xE4B27F2 (a4=0, single idx from [rbp+0x68], the same shape as 0x2BAEB00). Their callers are obfuscated. AIFunction_PartyLeave's execute 0x22F2AE0 (vtable 0x5974998, +0x38) is a jmp into .xtls 0xECD7910, so it cannot be decoded. FireMercenary (vtable 0x5974060, execute 0x22F46C0 -> 0x1759320) was not traced. Server clan vt+0x160 = 0x2B979F0 and vt+0x1A0 = 0x2BAEB00 (both remove) are reachable through virtual calls that were not enumerated. These parts are correct: SetAccompanyType execute 0x22FBB80 -> [vt+0x290]; 0x2AC936C calls 0x21523A0; the step machine skips event 0 (0x211DDD9..0x211DDDE); Mercenary_Heal's pivot+0x64 event is 0. The practical conclusion (use the plugin) may still be right, but impossibility is not shown.
+- HOLDS: What the comrade charts' OnParty_Command_Disband handler 0x21E does is not decoded.
+  aiscript/bin__/aichart.pai holds 34 entries '01 2C E1 C9 8E 07 00 00 00 <u32>'. All 34 point to 0x21E, and one is at 0x313177. I did not check that it belongs to Morrow's chart (0xA17A8F3E). The handler body is not decoded, so FireMercenary or PartyLeave inside it cannot be ruled out. That supports sending no event from the clone.
+
+ACTION REVIEW:
+Scratch files for this review are in gca\wf4\skd: keys.py, lists.py, lists2.py, chkblob.py, refs.py, back.py, f22586F0.txt, f22A4E80.txt, f2B99050.txt, f211DA30.txt. No project files were edited.
+
+BLOCKERS / MUST FIX
+1. PLUGIN 2: the TryPreempt AOB has a typo. '...4157 488D6CF9' is missing the SIB byte 0x24, because lea rbp,[rsp-7] is 48 8D 6C 24 F9. As written it matches nothing. The corrected pattern 48 89 5C 24 10 66 44 89 4C 24 20 55 56 57 41 54 41 55 41 56 41 57 48 8D 6C 24 F9 is unique at 0x2B36EF0 (it is also on line 3 of gca\plan_aob.txt). The hook signature itself is right. The only caller is .xtls 0x1067B868 with rcx=self, rdx=&result, r8=target, r9w=idx and four stack args at [rsp+0x20..0x38]. The caller treats [rbp-0x31]==0 as success (0x1067B86D). The original calls 0x3888B0(&u16) at 0x2B36FAE.
+2. Key collision. gca\wf5\make_recruit.py uses RECRUIT_KEY = 0xF5010 for the Test 4 Recruit clone. If both are built, there are two new_record intents for one key. The H1 hook matching 0xF5010 would then run DismissComrade when the player picks Recruit. Give them distinct keys (for example Dismiss = 0xF5011) and assert in both builders. Test 3 already uses 0xF5004/0xF5005.
+
+RISKS TO FIX OR TEST
+3. Input key, not 'prompt key'. The change at Wait+0x13F (blob +0x13D/+0x140/+0x13F) moves _inputKeyMapName from 'InteractionB' (0x5C3952A4) to 'InteractionA' (0xFC15F4E2, hashlittle seed 810718). InteractionA is vanilla Follow's button, and on camp comrades also Npc_Gift, Npc_Bind and Enemy_Mount. In Standby (type 1) and type 3, Follow and Dismiss are both visible on one button. Damiane, Oongka and the other mains keep each order on its own button: Follow A, Wait B, Heal X, Inspect Y. However, vanilla Disband sits on X with Talk, and comrades have Wait, Hyosi and Propose all on B, so the game may support several prompts on one button. Test Dismiss specifically in Standby: a misfire would remove her from the list when the player meant Follow.
+4. Labels. All three blobs parse field by field to exactly their length (378, 381, 383) with the wf5 parser. The only differences from Wait are the key, the name, the label, the target tree, pivot word 8 (event 0) and inputKeyMapName. There are no empty LocStrings, so the 13-byte issue does not arise, and no layout error was found. Variant B's kind-11 label has no precedent in interactioninfo (all 437 labels are kind 6 / 0x60 with their own key), but 'Dismiss' does exist in localstringinfo.paloc (id 1792731723151179952, flag 11). The risk is display only; fall back to A ('Disband', interaction.paloc 4295083260117088).
+5. The target tree logic is right. CheckAccompanyType (0x22A4E80) sets t=0 at 0x22A4F5D and ignores GetAccompanyType's return at 0x22A4F80. GetAccompanyType 0x21524C0 writes t only when the entry is found. The Not node (0x2441550) swaps 0 and 1 and keeps 2. So Dismiss shows only for entries of type 1-4. It does not exclude a downed comrade (cc+0x273). With a downed comrade, 0x2152070 calls vt+0x1C8 0x2B9A390 (0x21521F8..0x2152234), which takes the owner lock, calls 0x214E080 and sends a packet. The pump should refuse while she is downed or dead (0x1794ED0).
+6. PLUGIN 3 step 4 (a4=0): expect side effects even without the flag or unspawn. The vt+0x180 0x2B98E20 safe-spot teleport always runs (r9b=1). 0x206EED0 runs on her AI when owner->vt188(5) is true. If she was the last companion, the player's control entry is removed and 0x2152070 runs on the control actor (0x2151CB7..0x2151DD9); vanilla Disband does the same. Only call Release when err==0 and GetAccompanyType then returns false. Keep step 3 (mark DISMISSED) before step 4 in the same pump pass. The existing watchdog (game.cpp around line 1247) otherwise goes LOST and re-registers her when the actor is gone, for example after Disband unsummons a summoned copy.
+7. Step 7 (DismissFlag): flag 0x100000 is the DISBANDED flag. game.cpp's own note says the AI event filter 0x2074CD0 refuses a disbanded comrade (0x400), so later Follow or Standby events would fail until the flag is cleared. 0x205A749 inside 0x205A460 sets it under an unknown condition (bl), so 'camp-comrade state' is not shown. Keep it off by default and clear it on re-recruit.
+8. TEST b: event 0x8EC9E12C goes to handler 0x21E, which is not decoded and could unhire (FireMercenary 0xE5). Use it only on a backed-up save. Event 0xEEBE079C (Standby) has been used before.
+9. DATA 2: camp_extra uses inter.key(name), and 'Npc_Order_Dismiss' is not in the table, so it will KeyError. Pass the integer key. Adding it to KNOWN_INTERACTIONS is harmless but not needed, because vanilla lists contain only vanilla keys.
+
+OK AS PROPOSED
+- RemoveAccompany AOB is unique at 0x2151570; taking it from the E8 at 0x2BA1273 also works.
+- SetCharFlag's call shape at 0x2152193..0x21521A8 matches the typedef.
+- 0x3888B0 is a protected stub, called only.
+- H1 calls no clan functions and only does the same 0x3888B0 lookup the original does.
+- The pump runs on the server thread with no locks held. 0x2151570 takes and releases the owner lock itself (0x21517CA/0x2151E08) before calling 0x2152070.
+
+These actions ship no image. Per the user's note, the knowledge entry already shows each comrade's portrait, so there is nothing image-related to check here.
+
+===== portraits
+SUMMARY:
+Each character's Knowledge entry links it to a picture through three tables (characterinfo, knowledgeinfo, stringinfo). The game follows the same three steps itself in its world-map and faction UI code. Every characterinfo record has a _knowledgeInfo field holding a knowledge key. That knowledge record's _uiTextureName field holds a stringinfo key, which is the hashlittle(text, 810718) hash of a texture id such as "cd_knowledgeimage_Knowledge_GreyFur_Max". The image file is ui/texture/image/knowledgeimage/<texture id in lower case>.dds, because the UI looks up textureid(...) by file name. I wrote portraits.py at scratchpad\gca\wf4\portraits.py. It follows that chain for the 43 roster.h characters plus Kliff 1, Damiane 4 and Oongka 6, and found a picture for all 46 (46/46). All 46 are 512x512 DDS in DXT1 (BC1) format with 1 mip, 131200 bytes each. The script also builds images from them: Pillow 12.1.1 opens them once the script's unpack_dds() has turned the archive's "Partial" DDS back into a standard file. `--out DIR --size 128 --jpeg` wrote 46 JPEGs of about 5 KB each (376K on disk), using the same flatten-to-JPEG idea as DLLCrimson's convert_icon in build_data.py. The decoded pictures are correct waist-up portraits on a grey background; I checked Max, Matilda, Damiane, Oongka, Ziane and Kliff on a contact sheet (wf4\contact.png). The full run output is in wf4\portraits_run.txt.
+
+FINDINGS:
+- [high] The tables involved are knowledgeinfo (6713 records, 4-byte keys), stringinfo (31812 records) and characterinfo. Among the 134 binarystaticinfo tables there is also knowledgegroupinfo. No codex, encyclopedia or collection table exists.
+  game_files.entries(r'^gamedata/binarystaticinfo__/bin/.*\.staticinfoheader$') lists 134 tables (saved in wf4\tables.txt). The getters name their tables: 0x433650 reads the global at 0x6D69A98 with the name 'knowledgeInfo' (0x59BFA40); 0x388E00 reads 0x6D69A80 named 'stringinfo' (0x5A9B8F8); 0x389570 reads 0x6D69A48 named 'characterinfo' (0x58FEB90).
+- [high] The game itself goes character -> knowledge -> texture name like this: characterinfo +0x1EA (the u16 _knowledgeInfo handle), then knowledgeinfo +0x12 (the u16 _uiTextureName handle), then stringinfo +0x18, a pointer to the char* texture id. If that fails it uses 'cd_knowledgeimage_Knowledge_Unknown_Portrait'.
+  Function 0xF160A0 does exactly this: 0xF1650E calls 0x389570 (characterinfo), 0xF16533 reads movzx [rax+0x1ea], 0xF16571 calls 0x433650, 0xF16576 does lea rcx,[rax+0x12], 0xF1657A calls 0x388E00, and 0xF1657F reads mov rcx,[rax+0x18]. The fallback string is loaded at 0xF1664B. Function 0xF60F30 repeats the chain at 0xF61366-0xF61374, with its fallback at 0xF613DC. Both are world-map/faction UI functions (they also reference 'WorldMapIcon' and 'FactionFlagIcon_CommonUnknown').
+- [high] In characterinfo, the knowledge field is _knowledgeInfo, a u32 key in the file. It is read at 0x14F136A by 0x151E6C0 (a 4-byte read whose result is looked up as a knowledgeInfo key) into +0x1EA. It is followed by _knowledgeObtainType (u8, +0x1EC). In the file it comes right after the interaction list, in this order: f32 _interactionDistance, u32 _defaultActionActionIndex, u32 n + n*u32 _defaultShareValueIndex, f32 _characterWeight, u8 _battleOrderType, u8 _characterType, u32 _uiMapTextureInfo, u8 _mapIconDisplayType, then u32 _knowledgeInfo.
+  I walked the characterinfo reader 0x14F01A0-0x14F261F; its per-field error strings name each field (dump in wf4\charinfo_reader.txt). Readers: 0x21846B0 reads 4 bytes, 0x2590D90 reads a count plus u32s, and 0x1520CC0 reads 4 bytes. Record offsets of the field: Max 0x280 @0x23A = 0x7FFFFDE3; Matilda 0xF4C70 @0x249 = 0x7FFFFDEA; Morrow @0x221 = 0x7FFFFDE9; Aldric @0x246 = 0x7FFFFDCE; Laurent @0x225 = 0x7FFFFDE8; Ryan @0x224 = 0x7FFFFDE0; Nairah 0x19C @0x1F5 = 4; Yann @0x1F7 = 3; Dwayne 0x195 @0x1F9 = 7; Shane @0x20B = 6; Ziane 0x19B @0x23F = 0x7FFFFFFE; Damiane 4 @0x202 = 0xD; Oongka 6 @0x205 = 2; Kliff 1 @0x1F7 = 1.
+- [high] The knowledgeinfo record layout is: u32 _key | u32 len + _stringKey | u8 _isBlocked | u32 _uiTextureName (a stringinfo key; the picture) | u8 _isDefault | u32 _factionInfo | u32 _factionNodeInfo | u32 _skillInfo | u32 n + n*u32 _characterInfoList | ... Each character's own key is in the _characterInfoList of its knowledge entry, which gives a second, independent check.
+  I walked the knowledgeinfo reader 0x150D740 (dump in wf4\knowledgeinfo_reader.txt): _uiTextureName is read at 0x150D802 by 0x1520520 (4 bytes, looked up in stringinfo) into +0x12. Examples: Knowledge_Kliff has 0x4884FA55 at record offset 0x18; Knowledge_GreyFur_Max has 0x792F14CD at 0x1E and _characterInfoList [0x280]; Knowledge_GreyFur_Andrew lists [0x287]; Knowledge_Nairah lists [0xF52CC, 0x19C, 0x1BC]; Knowledge_Demian lists [4, 0x194]. For all 46 characters the reverse list agrees with the characterinfo field.
+- [high] A stringinfo record is u32 key | u32 0 | u8 0 | u32 len | text. The key is hashlittle(text, 810718) and is case-sensitive (unlike tables.hash_name, which lower-cases first).
+  stringinfo record 0x4884FA55 is 'cd_knowledgeimage_Knowledge_Kliff', and game_files._hash_little(b'cd_knowledgeimage_Knowledge_Kliff', 810718) = 0x4884FA55. All 31812 records parse exactly with text at offset 13.
+- [high] File rule: ui/texture/image/knowledgeimage/<stringinfo text in lower case>.dds, for example ui/texture/image/knowledgeimage/cd_knowledgeimage_knowledge_greyfur_max.dds. The UI resolves textureid(name) by file name, and the names are case-insensitive.
+  changecharacternoticepanel.css uses 'background-image: textureid(cd_knowledgeimage_knowledge_kliff)'. Across 19764 ui/texture stems only 11 appear twice (each a copy in ui/texture and one in image/). The 4837 files in ui/texture/image/knowledgeimage include every file the 46 characters need.
+- [high] Don't build the knowledge name from the roster name: use the chain. Some names differ, for example Piers 0x283 -> Knowledge_GreyFur_Pierce (0x7FFFFDDE), Damiane -> Knowledge_Demian (0xD), Kliff -> Knowledge_Kliff (1) and Oongka -> Knowledge_Oongka (2). Camp comrades use Knowledge_GreyFur_<Name> (keys 0x7FFFFDC7-0x7FFFFDED). The story Greymanes use Knowledge_Yann 3, Knowledge_Nairah 4, Knowledge_Shane 6, Knowledge_Dwayne 7 and Knowledge_Ziane 0x7FFFFFFE. In the brief, 'Naira / Duane / Jian' are the game's Nairah / Dwayne / Ziane, matching roster.h.
+  From the portraits.py output (wf4\portraits_run.txt). Matilda also has the decoy entries Knowledge_Her_Matilda 0xF4A2E and Knowledge_Matilda 0x7FFFFF7B, but her characterinfo field points to Knowledge_GreyFur_Matilda.
+- [high] Image format: every one of the 46 pictures is a DDS with fourCC DXT1 (BC1), 512x512, 1 mip, 131200 bytes (128-byte header + 131072), not compressed in the archive. A few other knowledge images are DXT5 (BC3) and LZ4-compressed, for example cd_knowledgeimage_knowledge_unique_aldric.dds (262272 bytes, packed 72540). The archive marks them 'Partial': the header's reserved dwords at 0x20 hold (stored size, size) of the top mip, and when the two differ the top mip is an LZ4 block.
+  The header dumps show the flags 0x000A1007 and the fourCC at 0x54. In the aldric header, 0x20 = 0x11ADC (72412 = 72540 - 128) and 0x24 = 0x40000. game_files.read() crashes on that file (LZ4BlockError) because unpack_sections assumes the PAR section table at 0x10. portraits.unpack_dds() handles both cases and clears 0x20-0x4B. Pillow 12.1.1 opened both the DXT1 and the LZ4 DXT5 file (wf4\lz4_check.png).
+- [high] DLLCrimson does not decode game DDS files. build_data.py only converts the mod's own unpacked DDS icons with PIL (convert_icon at line 433: open, convert to RGBA, thumbnail, alpha_composite onto the cell colour, save as JPEG quality 85). The same steps work here once unpack_dds() has run, and portraits.py --jpeg follows that pattern.
+  In build_data.py, lines 427-440 are convert_icon and ICON_BACKGROUND, and line 620 is the icon naming. No other DLLCrimson tool handles DDS (grep).
+- [medium] characterinfo also has a _uiPortraitPath field (+0x174, read at 0x14F110D), but it can't be used. For the Greymanes and the main three it holds names like cd_portraitimage_Knowledge_GreyFur_Ryan, and none of those files exist. The story Greymanes other than Shane have the hash 0xEAC5E173 there, which has no stringinfo entry. Only 5 real portrait files exist: ui/texture/image/portraitimage/cd_portraitimage_chracter_{kliff,demian,oongka,yann,nairah}.dds, 256x256 DXT5.
+  From the portraits.py output (_uiPortraitPath column) and the folder listing (wf4\ui_images.txt). Some of these names are leftover developer names: Balder -> GreyFur_Iron, Joseph -> GreyFur_Heinz, Laurent -> GreyFur_Lorenzo_Camp, Morrow -> GreyFur_Mauro.
+- [low] The game probably shows the Unknown portrait until the player has obtained the knowledge. In the HUD, the mod can show the real image regardless.
+  0xF1655D calls 0x652F40 with the knowledge handle (dx stored at [rbp+0x178]) and r8d=1. 'test al, al; je 0xF16637' then goes to the Unknown_Portrait branch. I did not disassemble 0x652F40, so what it checks is inferred.
+
+ACTIONS:
+- No data edits are needed: the pictures already exist in the game and are only read.
+- Build step (read-only on the game files): python "scratchpad\gca\wf4\portraits.py" --out <build dir>\portraits --size 128 --jpeg  -> writes <key hex 6>_<Name>.jpg for all 46 characters, about 5 KB each and about 230 KB in total. Add --keep-dds to also write the unpacked standard DDS files. Without --size the images stay 512x512 PNG.
+- Optional runtime alternative (plugin, on the game thread, read-only): handle = *(u16*)(CharacterInfo(0x389570)(&charHandle) + 0x1EA); if handle != 0xFFFF: kn = KnowledgeInfo(0x433650)(&handle); s = StringInfo(0x388E00)((u16*)(kn + 0x12)); const char* id = **(const char***)(s + 0x18). This is how 0xF16533-0xF16583 does it. It gives the texture id, not pixels, so build-time JPEGs embedded like the CC icons are the simpler route for an ImGui/D3D HUD.
+
+OPEN:
+- The pictures are 512x512 waist-up shots on a grey background with the head in the upper middle. Should the HUD use a square face crop (for example the top-centre 256x256 region before downscaling) or the whole picture?
+- Should the HUD show a companion's real picture before the player has unlocked that companion's Knowledge entry? The game's own UI seems to show the Unknown portrait in that case; 0x652F40 is not verified.
+- portraits.py finds _knowledgeInfo by first locating the interaction list, the same way build_test.py does, then reading forward. It worked for all 46, but a character with an unusual record could need the full characterinfo reader layout (wf4\charinfo_reader.txt) instead.
+
+VERDICTS:
+- HOLDS: Tables: knowledgeinfo (6713 records, 4-byte keys), stringinfo (31812), characterinfo; knowledgegroupinfo among 134 binarystaticinfo tables; no codex/e
+  Re-listed the archive: 134 .staticinfoheader tables, and none is a codex, encyclopedia or collection table. The collection_* files are binarygimmick, not tables. tables.Table gives knowledgeinfo 6713 records (key_size 4), stringinfo 31812, characterinfo 7250 and knowledgegroupinfo 616. The getters check out: 0x433650 reads [0x6D69A98] with 'knowledgeInfo' at 0x59BFA40 (0x4336A2), 0x388E00 reads [0x6D69A80] with 'stringinfo' at 0x5A9B8F8 (0x388E52), and 0x389570 reads [0x6D69A48] with 'characterinfo' at 0x58FEB90 (0x3895C2).
+- HOLDS: Game chain: characterinfo +0x1EA (u16 knowledge handle) -> knowledgeinfo +0x12 (u16 _uiTextureName handle) -> stringinfo +0x18 -> char* texture id; fa
+  The chain is confirmed: call 0x389570 at 0xF1652E, movzx [rax+0x1EA] at 0xF16533, 0x433650 at 0xF16571, lea [rax+0x12] at 0xF16576, 0x388E00 at 0xF1657A, then mov rcx,[rax+0x18] / mov rdx,[rcx] at 0xF1657F/0xF16583. 0xF60F30 does the same at 0xF60F8E-0xF60F9B and 0xF61366-0xF61374. Correction: the fallback is not used when a lookup fails. The chain has no failure branch apart from the handle==0xFFFF skip at 0xF1651A (esi=0xFFFF). In 0xF160A0 the Unknown portrait (0xF1664B) is picked when the protected check 0x652F40(_, knowledgeHandle, 1) returns false (call 0xF1655D, je 0xF16564). In 0xF60F30 it is picked when a per-player value indexed by the knowledge handle is <= 0 (read at 0xF60FF7, tested at 0xF6135A). In short, vanilla shows the Unknown portrait until the player has learned that entry. Nit: 0xF1650E is the lea; the calls are at 0xF16515 and 0xF1652E. The world-map/faction strings are present in both functions. 0xF160A0 also uses 'cd_knowledgeimage_Knowledge_unknown_mercenary', which factionmanagementpanel.css uses too.
+- HOLDS: characterinfo _knowledgeInfo: u32 in file, read at 0x14F136A by 0x151E6C0 into +0x1EA, followed by _knowledgeObtainType u8 +0x1EC; file order after th
+  My own walk of 0x14F11F1-0x14F13A3 matches, with Korean error strings naming each field. +0x1B8 _interactionInfoList (0x1520BE0: count, then elements), +0x1C8 _interactionDistance (4), +0x1CC _defaultActionActionIndex (0x21846B0, 4), +0x1D0 _defaultShareValueIndex (0x2590D90: count + n*4), +0x1E0 _characterWeight (4), +0x1E4 _battleOrderType (1), +0x1E5 _characterType (1), +0x1E6 _uiMapTextureInfo (0x1520CC0: 4 bytes, looked up in [0x6D6E418]), +0x1E8 _mapIconDisplayType (1), +0x1EA _knowledgeInfo (0x151E6C0: 4 bytes, looked up in [0x6D69A98], 0xFFFF when missing), +0x1EC _knowledgeObtainType (1). All 14 offset/value pairs match the bytes exactly (wf4\sk\t2.py). A separate backward walk (wf4\sk\t4.py) also fits for all 46: interaction list, distance 2.0, share list, then the field. Small caveat: _characterWeight is only a 4-byte read and is 0 everywhere, so calling it f32 is unverified.
+- HOLDS: knowledgeinfo layout: key | len+_stringKey | u8 _isBlocked | u32 _uiTextureName | u8 _isDefault | u32 _factionInfo | u32 _factionNodeInfo | u32 _skill
+  Reader 0x150D740 confirms it, with field names from the error strings at 0x5782DA0-0x57825C0: _stringKey 0x141F4C0, _isBlocked 1 byte at +0x10, _uiTextureName 0x1520520 (4 bytes looked up in stringinfo [0x6D69A80]) into +0x12 at 0x150D802, _isDefault 1 byte, _factionInfo 0x151E780, _factionNodeInfo 0x151E980 and _skillInfo 0x1522380 (4 bytes each), _characterInfoList 0x1520F20 (count + 0x151E4F0 4-byte characterinfo keys) at +0x20. All 6713 records parse and every listed key exists in characterinfo. The examples are exact: Kliff tex @0x18=0x4884FA55, Max @0x1E=0x792F14CD [0x280], Andrew [0x287], Nairah [0xF52CC,0x19C,0x1BC], Demian [4,0x194]. Each of the 46 appears in exactly one _characterInfoList, and it equals the characterinfo field. Note that 1266 of 6713 knowledge records have a texture key that is not in stringinfo (none of the 46).
+- HOLDS: stringinfo record = u32 key | u32 0 | u8 0 | u32 len | text; key = hashlittle(text, 810718), case-sensitive.
+  All 31812 records have this exact layout, with the text at offset 13 running to the end of the record. For all 31812, _hash_little(text, 810718) == key. 0x4884FA55 = 'cd_knowledgeimage_Knowledge_Kliff'. The lower-case hash is 0x804EF4C5, so the hash is case-sensitive.
+- HOLDS: File rule ui/texture/image/knowledgeimage/<lower-case text>.dds; textureid() resolves by stem, case-insensitive; 19764 stems, 11 duplicates; 4837 know
+  Confirmed: 19775 ui/texture .dds files, 19764 stems, 11 duplicates. None of the duplicates is one of the 46; the only knowledge one is morufort_accountbook. There are 4837 files in knowledgeimage. changecharacternoticepanel.css has textureid(cd_knowledgeimage_knowledge_kliff). Case-insensitivity is inferred rather than shown in code: 0 of 2,052,523 archive paths contain upper case, while stringinfo texts are mixed case (e.g. 'Cd_Knowledgeimage_Knowledge_Matilda'). All 46 files exist and are DXT1 512x512.
+- HOLDS: Use the chain, not roster names: Piers->Knowledge_GreyFur_Pierce 0x7FFFFDDE, Damiane->Knowledge_Demian 0xD, Kliff->1, Oongka->2; camp comrades Knowled
+  Every listed key is correct for the 46 roster keys. The Matilda decoys are confirmed: Knowledge_Her_Matilda 0xF4A2E has texture common_06 and an empty list; Knowledge_Matilda 0x7FFFFF7B lists [0xF45EF]. feasibility_2026-10-02.txt lines 17-21 confirm the brief's spellings. Caveats: (1) The key range is not only Greymanes: 0x7FFFFDD4 is Knowledge_Robot_Worker. (2) 'Use the chain' gives the WRONG picture for Yann's companion copies. 0xF5235 'Yann' (field @0x20E = 1) and 0x2 'Yahn' (field @0x1FC = 1) both point to Knowledge_Kliff, whose _characterInfoList is [1, 0xF4A81, 0xF5235, 2, 0xF52DC, 0x190, 0xF5238]. Young Jian 0x191 points to Knowledge_Faction_Graymane 0xF452D. The chain is only safe on the roster's story/camp keys. 0xF52CC Nairah is fine (Knowledge_Nairah).
+
+ACTION REVIEW:
+Nothing proposed can unhire a comrade or break save loading. No DMM data is edited, and nothing calls DisbandByKeys 0x2BA10A0, SetAccompanyType 0x21523A0, Ack 0x297EF40 or the interaction step 0x211DA30. Action 1 ("no data edits") is correct.
+
+Action 2 (build step) is read-only on the game. game_files reads the .paz files 'rb' through the Crimson Browser Sharp index cache, tables.py only reads, and portraits.py writes only under --out. I checked the existing output wf4\jpg: 46 files, 128x128, 3874-5500 bytes, 206,397 bytes in total (the claim said about 230 KB). My contact sheet wf4\sk\contact_sk.png shows 46 cleanly decoded, distinct portraits with no LZ4/DXT garbage, and the women are where expected (Damiane, Nairah, Matilda, Evelyn, Joan). The file names use the roster key, so the pictures are correct as long as the HUD looks them up by roster key.
+
+Conditions:
+(a) Look up portraits by the person's roster key, never through the chain on the live actor's own characterinfo record. If Approach A hires Yann's companion copy 0xF5235 (or 0x2 'Yahn'), the chain gives Kliff's picture. Map 0xF5235 and 0x2 to 0x192, and 0xF52CC to 0x19C (or show no picture). Keys not in the roster should show no image.
+(b) These are game art files. Keep the generated JPEGs out of the GitHub repo, as with the Seasons rule of no game assets, and let the user decide whether to embed them in the release .asi. The alternative is to generate them on the player's machine.
+(c) Re-run after game patches. The index cache must match the installed game; unpack_dds raises on a size mismatch, so a stale index fails loudly instead of producing a wrong image.
+
+Action 3 (runtime alternative) is riskier:
+(1) It has the same wrong-image problem for 0xF5235 and 0x2.
+(2) It does not check that the u16 at kn+0x12 is not 0xFFFF. 1266 of 6713 knowledge records have a texture key missing from stringinfo, and the out-of-range getter path returns the default object at [0x6CFDED0] (see 0x433758, and 0x388E1F jae for stringinfo), so dereferencing +0x18 then * may crash. Check for 0xFFFF and for a null pointer.
+(3) charHandle must be the u16 table index the plugin already passes to g_charInfo (CharKeyOfIndex), not the u32 key.
+(4) The getters deserialize records lazily on first access (0x4336BF-0x433725). Call them only from the thread the plugin already uses for g_charInfo.
+(5) Vanilla shows Unknown_Portrait until the player has learned the knowledge entry (0x652F40 gate at 0xF1655D; per-player value at 0xF60FF7). Showing the real picture regardless is harmless for recruited comrades.
+(6) It yields only a texture id, so a D3D/ImGui HUD still needs pixels. The build-time route is the right choice.
+
+My scratch checks are in scratchpad\gca\wf4\sk\ (t1-t8.py, fF160A0.txt, fF60F30.txt, contact_sk.png).
+

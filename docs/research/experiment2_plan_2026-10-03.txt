@@ -1,0 +1,274 @@
+EXPERIMENT 2 PLAN: GreymaneCompanions.asi (game build 0x6AB28F00 / 0x173AB000)
+
+Short answer:
+- Item 1 can be done now with checked code. One branch still needs one click from the player (3.4).
+- Item 2 is only partly solvable. The cause of Matilda's vanish is still unknown. This build adds two fixes that use checked code paths: it raises her logout distance, and it re-summons her near the player if her actor is gone. It also adds a manual rescue key and the logging that will name the cause.
+- Item 3 is fully covered (section 5).
+- Items marked [UNVERIFIED] rest on inference.
+
+1. NEW GAME FUNCTIONS
+
+The plugin's scheme stays the same: check the build, check the prologue bytes at each known address, and decode call targets from known call sites. If any check fails, it hooks nothing and logs why.
+
+1.1 Read lock, 0x393DF0: `void* fn(void** out, void* lockObj)`
+- Take it from the E8 at 0x21524F7.
+- Release: `lockObj->vt[0x20](lockObj, 1)`.
+- For the clan list, lockObj is [owner+8]. For an actor, it is [actor+8].
+- Game code uses it this way at 0x21524C0 and 0x211DAA8.
+
+1.2 GetAccompanyType, 0x21524C0: `bool fn(clan, u16 idx, u8* out)`. It takes the clan lock itself.
+
+1.3 SetAccompanyType, 0x21523A0: `bool fn(clan, u16 idx, u8 type)`. Take it from the E8 at 0x2AC936C.
+
+1.4 SendSetAccompanyTypeAck, 0x297EF40: `void fn(owner, Finder*, CharacterInfo*, u8* type)`
+- Take it from the E8 at 0x2AC93C4.
+- Finder is 0x18 bytes: {vt = base+0x5B25438; u8 0 at +8; u64 at +0x10 = owner->vt[0xE8](owner)}.
+- CharacterInfo* comes from 0x389570(&idx).
+- This is exactly what the game does in 0x2AC9270.
+
+1.5 AI event building, the same steps as the game's step machine (0x211DE06..0x211DEB9):
+- 0x206C220: `u32 fn(u32 hash)`. From the E8 at 0x211DE06.
+- 0x17B62A0: `fn(u32 key[3])`; its return value is ignored. From the E8 at 0x211DE14.
+- 0x17B54D0: `void* fn(void* req, const u32 key[3])`. From the E8 at 0x211DE23.
+
+1.6 Deferred raise, ServerAiActorComponent vt+0x190 = 0x2AC5910 (plain code): `u32* fn(ai, u32* res, u64 delay=0, const void* req, u8 arg5=0)`
+- Check that the qword at base+0x5B28988+0x190 equals base+0x2AC5910.
+- It posts message 0x7F1. The handler 0x2C31680 later calls 0x2AC6390 on the server.
+- The game makes the same call at 0x285CF22.
+- The immediate slot vt+0x188 = 0x2AC6390 is a protected stub: call it only, and it is not used in this build.
+
+1.7 "Server runs her AI", actor vt+0x188 = ServerActor 0x28F3030: `bool fn(actor, u8 5)`
+- I re-checked the code. It returns false for kind 7, true if [[a+0x68]+0x40]==0, false if posComp+0x3DC!=0, and otherwise ([a+0x90]==0).
+- The game's step machine raises an interaction's AI event on the server ONLY when this returns true (0x211DD8C..0x211DDAF). Otherwise the client raises it on its own copy of her AI.
+- Call it under the actor read lock.
+
+1.8 SetLogoutDistance, 0x28FA550: `void fn(Actor*, float)`
+- It writes [[a+0x68]+0x20]+0x468 under the actor's write lock.
+- AOB: 40 53 48 83 EC 40 C5 F8 29 74 24 30 C5 F8 28 F1 48 8B 41 68
+- Do not hold the actor lock when calling it.
+
+1.9 MercenaryInfo by index, 0x3891B0: protected stub, call only. Used for logging only.
+- `MercInfo* fn(const u16* idx)`, with idx at CharacterInfo+0xBE.
+- Take it from the E8 at 0x2BB326F.
+- Runtime fields: +0x20 _mercenaryType, +0x21 _farFromLeaderOption.
+
+1.10 DisbandByKeys, 0x2BA10A0: `u32* fn(clan, u32* err, Span{u32* data; u32 count; u32 cap}*)`. Used only for the give-up cleanup in 4.2. Its client sync is [UNVERIFIED].
+
+1.11 Rescue teleport. This mirrors the clan's own teleport 0x2B98E20, which I re-read:
+- 0x17FA6C0 `(Actor* owner=[clan+8], u8 s[0x40] zeroed)`. field = *(s+8); acquired = s[0x10].
+- 0x2443E60 `(u8 p[0x120], 16-byte aligned)`. Then set p[0xE8]=0, *(u64*)(p+0xEC)=0, p[0xF4]=0.
+- 0x2B97DF0 `(clan, field, u16 charIdx=[[a+0x68]+0x20]+0x30, const float c[3], u8* p as 5th argument)`. c is in world coordinates.
+- 0x2BCD120 `(posComp=[[a+0x68]+0x1A0], u32* res, p)`. Protected stub: call only. Take it from the E8 at 0x2B98FDA.
+- Release: `obj=*(void**)(s+0x28); obj->vt[0x148](obj); 0x1434880(s)`.
+- AOBs:
+  - 0x17FA6C0: 48 89 54 24 10 53 48 83 EC 30 48 8B DA C7 44 24 20 00 00 00 00 48 8B 41 68 48 8B 88 A0 01 00 00 48 8B 01
+  - 0x2443E60: 48 83 EC 28 48 C7 41 18 00 00 80 3F
+  - 0x2B97DF0: 48 8B C4 48 89 58 08 48 89 70 10 55 57 41 56 48 8D 68 A9
+- Fallback mover: ServerAi vt+0x208 = 0x2AC5610 `(ai, u32* err, u64 unused, const u8 t[0xE8])`. Initialise t with 0x2443E60 first; that gives identity rotation and scale 1. Write world xyz at +0.
+
+1.12 Existing calls that stay: 0x2150930, 0x389570, 0x2A82370, 0x1434880, 0x4F8220, and the H0 hook on 0x2773C20.
+
+1.13 New error names for the log:
+- 0x6CF6E5C InvalidAiOnceTimer
+- 0x6CF6DC0 InvalidAIState
+- 0x6CDB978 InvalidTrData
+- 0x6CDB970 TrDeserializeFailed
+- 0x6CF6E64 InvalidAiActorComponent
+- 0x6CF7944 LogoutDistanceFar
+- 0x6CF7040 LogoutByMercenaryCall
+
+2. THREAD AND LOCK RULES
+
+1. All game calls run only inside H0, on a server thread (TLS+0x1EC != 0). Hotkeys only set atomic requests.
+2. Single pump: in H0, if at least 250 ms have passed and InterlockedCompareExchange(&busy,1,0)==0, run the pump, then set busy=0. The follower table (at most 4 entries) is touched only by the pump.
+3. Copy clan+0xB8/+0xC0 and the clan+0x18 records under the owner read lock (1.1), then release it. Never hold that lock while calling AccompanyMercenary, SetAccompanyType or DisbandByKeys: 0x2150930 takes it exclusively at 0x2150A3C.
+4. Read positions the way the game does: take the actor read lock, call 0x4F8220, release. World x = x + sx*1000 and z = z + sz*1000.
+5. Never hold an actor lock while calling 0x28FA550, 0x21514A0 or 0x1795490; they take it themselves.
+6. Probe hooks (section 6) only log. They read a tracked-key array (4 x volatile u32) and never call game functions. The logger is already SRW-locked.
+7. No client-thread calls in this build. In particular, never call 0x8A67E0 from H0.
+
+3. F9: PICK, REGISTER, START FOLLOWING
+
+3.1 Pick, under the owner read lock, copying the records. A record qualifies when:
+- idx != 0xFFFF and mercNo (+0x28) != -1, and actorKey (+0x50) != 0;
+- its CharacterKey is in roster.h;
+- findActor finds it, and it is within 20 m;
+- the nearest one wins.
+
+How to tell people from animals:
+- roster.h is generated from static data by the rule "characterinfo mercenary byte is 0x46 (Mercenary_Melee) or 0x47 (Mercenary_Range), plus a hire message", plus the story Greymanes. I checked: Matilda is 0x47 and Aldric 0x46. Damiane and Oongka are 0x40. Kliff is 0xFF. The dog's record has a different layout and is not in roster.h. So the key list is the reliable filter today.
+- Extra runtime check, likely but [UNVERIFIED]: skip kind [[a+0x88]+1] 5 (Vehicle) or 6 (Pet). The enum at 0x191640 is 0 User, 1 Player, 3 NonPlayerCharacter, 4 Mercenary, 5 Vehicle, 6 Pet, 7 Gimmick.
+- To drop names later: for every record, log CharacterInfo+0xBE, MercInfo+0x20 and MercInfo+0x21. A runtime rule can then replace roster.h in experiment 3.
+
+3.2 Register:
+- If her idx is already in clan+0xB8 (for example Aldric), skip this step.
+- Otherwise call AccompanyMercenary as experiment 1 does: {controlKey, key}; outPairs cap 4; keep the guard "clan+0xF0 must be 0".
+- Note: *err is always 0, because vt+0x150 errors are dropped (0x21512A2). Judge success by reading her entry afterwards.
+- I verified that the actorKey written by vt+0x150 is copied back into her clan+0xB8 entry at 0x2151214.
+- Add her to the managed set: charKey, idx, actorKey, phase.
+- Save the old leash (float at cc+0x468, where cc = [[a+0x68]+0x20]), then call 0x28FA550(a, 1.0e6f).
+
+3.3 Start following, at least 500 ms later, in the pump:
+1. ai = [[a+0x68]+0x58]. Require it non-null with vtable base+0x5B28988.
+2. gate = a->vt[0x188](a, 5) under the actor read lock. Log [a+0x90] next to the player's user key [[player+0xA0]+0x60].
+3. If gate is true (the server runs her AI), replay exactly what worked by hand: the Standby event, then the Follow event.
+   - RaiseDeferred(hash):
+     - `key = {0xFFFF, hash, 0x206C220(hash)}`
+     - `0x17B62A0(key)`
+     - `alignas(16) u8 req[0x100] = {0}`
+     - `0x17B54D0(req, key)`
+     - `*(u32*)(req+0x18) = *(u32*)(req+0x1C) = selfKey` (the player's actor key, as the step machine uses)
+     - `*(u32*)(req+0x50) = 0` [UNVERIFIED value for these orders]
+     - `u32 res = 0; ai->vt[0x190](ai, &res, 0, req, 0)`
+   - At T+0, RaiseDeferred(0xEEBE079C) (OnParty_Command_Wait). At T+1.0 s, RaiseDeferred(0xF5BFEE82) (OnParty_Command_Follow_Offensive).
+   - Then log GetAccompanyType every 250 ms for 4 s. Seeing 2, then 1, then 2 proves her AI chart handled both events, because the chart sets the type itself. [UNVERIFIED: the chart handlers 0x21C/0x21D are not decoded.]
+   - Compile switch DIRECT_FOLLOW=1 sends only the Follow event, for a later comparison.
+   - If the type never changes, use the fallback in 3.4.
+4. If gate is false, the client runs her AI. The game itself never raises the event on the server in that case, and the plugin has no client-thread raise yet.
+
+3.4 Fallback (one click):
+- Call SetAccompanyType(clan, idx, 1), then the Ack (1.4), with type 1.
+- Vanilla "Follow" then shows on her at once. Pressing it worked in game.
+- Log: "client runs her AI: talk to her, press Follow".
+- The pump sees the type become 2 and switches her to FOLLOWING.
+
+4. KEEPING HER WITH THE PLAYER
+
+4.1 Prevention: the leash from 3.2.
+- It stops the sweep's distance tests: 0x28F9A20, and options 0/2 of 0x2BB3190.
+- It does NOT stop:
+  - logouts when her spawner is missing (0x2C37C8C..0x2C37FB7), which can happen once the camp unloads;
+  - the deadline logout at cc+0x428 (0x2C37645);
+  - the leader-missing logout (0x2C38C2A).
+- Re-apply it to every new actor key.
+- When her entry disappears (vanilla Disband) and the actor still exists, restore the old value.
+
+4.2 Recovery when her actor is gone (on by default; the code path is checked):
+- Trigger: two polls in a row, at least 1 s apart, where findActor(entry.actorKey) fails, or record+0x50 is 0, or record+0x50 != entry.actorKey. The player must be found, so loading screens do not count.
+- Action: call AccompanyMercenary {controlKey, key} again.
+  - 0x2B98830 only summons when the key is 0 or does not resolve. It logs out any same-character copy in the leader's field (reason 0x1F), then summons her next to the leader through 0x2BA9340.
+  - The new key is copied into the entry.
+- After the call, read entry.actorKey:
+  - If it is not 0: wait 2 s, re-apply the leash, and re-run 3.3.
+  - If it is 0: the summon failed, and the client now drops every 0x9FB update. Retry after 10 s, then after 30 s. After 3 failures, call DisbandByKeys {key} to unblock syncing and log "gave up".
+- The success of a Melee/Range summon outside the Follow into Combat context is [UNVERIFIED]. Known error codes are listed in 0x2B89D70.
+
+4.3 Rescue when she is alive but stranded. In this build it runs only on F10, and is logged as "would rescue" otherwise.
+- Stranded means:
+  - distance > 1.5 x [0x6CF8AB8] (64 m by default) for at least 8 s; or
+  - the server flag cc+0x390|+0x394 & 0x8000000 (hidden) stays set for at least 8 s.
+- Order of calls:
+  1. Open the field scope (1.11).
+  2. Exclusion check: stage = field->vt[0x40](field); take the read lock on [stage+8]; if her CharacterKey is in the u32 list at stage+0x1A0 (count at +0x1A8), skip.
+  3. Call 0x2443E60(p), then 0x2B97DF0 with c = the player's world xyz.
+  4. Sanity check: p's xyz must be non-zero and within 25 m of the player.
+     - If it passes: call 0x2BCD120.
+     - If not: call 0x2AC5610(ai, &err, 0, t), with t = the player's position + 1.5 m on x.
+  5. Release the scope.
+  6. If gate is true, raise Follow again as in 3.3.
+- Limits: 15 s cooldown, at most 3 tries per 5 minutes.
+- Using the player's position as the search centre is [UNVERIFIED]; the game passes the comrade's own position.
+- For a client-run AI the move may not reach the controlling client, because 0x2BCD8A0 uses ToNearExceptOneControlSendTargetFinder [UNVERIFIED]. A teleport does not clear a hide flag set on the client side.
+
+4.4 States:
+- Entry type 1 (the player chose Standby): pause 4.2 and 4.3.
+- Entry gone: restore the leash and stop managing her.
+- Entries that F9 did not start this session (old Aldric) are logged only, never acted on.
+
+5. STATUS LOG
+
+Written every 2 s from the pump, plus at once when something changes (see the end of this section).
+
+5.1 Header:
+- H0 calls per second and the thread id
+- the player's actor key and world position
+- [0x6CF8AB8] (far distance) and [0x6CF52D8] (teleport minimum, default 32 m)
+- clan+0xC0 count and clan+0xF0 (remembered count)
+- a WARNING if any entry has idx 0xFFFF or actorKey 0 (the client would drop all 0x9FB)
+
+5.2 Each accompany entry: idx, CharacterKey, actorKey, type, mercNo.
+
+5.3 Each managed comrade:
+- Record fields: +0x50, +0x28, +0xC4; the dwords in 0..0xD8 that changed since the last poll (this catches the despawn writes to +0x50, +0xC4 and +0xC8..+0xD4); the entry's 0x18 bytes as a diff.
+- Actor found (y/n); world position; distance to the player; jump since the last poll; kind; [a+0x90]; gate.
+- From cc:
+  - flags +0x390 and +0x394 (0x8000000 hidden, 0x100000 disbanded, 0x400000 not yet in the field)
+  - spawn type +0x2D0 (0xC NPCSchedule, 0x27 DailyRoutine, 0xE SummonMercenary)
+  - leash +0x468, +0x428 (raw u32), +0x278
+- B = [[a+0x68]+0xB0], null-checked: spawner key +0x2D8 and byte +0x3B9.
+- M = [[a+0x68]+0x118], null-checked: leader key +0x1C.
+- From ai: +0x18 (the sequence number a teleport request must match), and state [[ai+0x48]+0x18] (or +0xB8) with state+0x68.
+- Once: CharacterInfo+0xBE, MercInfo +0x20 and +0x21.
+
+5.4 Logged at once on change: type, actor lost or found, record+0x50, a jump of more than 30 m, a flag change, and every re-summon or rescue attempt with its result.
+
+6. LOG-ONLY PROBES (MinHook, plain code)
+
+All AOBs below were checked unique by the skeptics. Each probe calls the original and changes nothing.
+
+6.1 P1, 0x29841B0, TrAITeleportReq handler, server.
+- AOB: 48 89 5C 24 08 55 56 57 41 54 41 55 41 56 41 57 48 8D AC 24 10 FF FF FF 48 81 EC 00 02 00 00 4D 8B F0 48 8B FA 4C 8B F9
+- Declare 6 u64 arguments so all of them are passed through.
+- On entry: actorKey = *(u32*)(*(u8**)(r8+0x18)+5), inside __try. Clear a thread-local "P2 ran" flag.
+- After: log *res, and "dropped before validation" if P2 did not run. That covers an owner mismatch, missing AI, an early exit or a deserialise failure.
+
+6.2 P2, 0x2AC5BF0, `(ServerAi* c, u32* err, desc*, u64* seq)`.
+- AOB: 48 89 5C 24 10 55 56 57 41 54 41 55 41 56 41 57 48 8D AC 24 90 FB FF FF
+- Before: key [[c+8]+0x60], *seq against *(u64*)(c+0x18), desc xyz, [actor+0x90].
+- After: *err, by name.
+
+6.3 P3, 0x2AC5610, server-run AI teleports: key, target xyz, *err.
+- AOB: 48 89 5C 24 10 48 89 74 24 18 57 48 81 EC 20 01 00 00 48 8B 41
+
+6.4 P4, 0x28F9A20, the clean-up sweep's distance test `bool(Actor*, const float* ref, const void* area)`.
+- AOB: 48 8B C4 48 89 58 08 48 89 68 10 48 89 70 20 57 48 81 EC 80 00 00 00 C5 F8 29 70 E8 C5 F8 29 78 D8 C5 78 29 40 C8 C5 78 29 48 B8
+- Log only when it returns 1 and the actor key is tracked. It runs for every actor, so the hot path must be tiny.
+
+6.5 Optional P5, 0x1764120, the TeleportDesc destination, on both client and server.
+- Take its address from the E8 at 0x1763A9C (its prologue is not unique).
+- After the original returns, read the transform from its 5th argument, and the actor as [rcx+8]+0x60 [UNVERIFIED argument roles].
+- Log the side (TLS+0x1EC). This shows whether her chart aimed at the player or at camp.
+
+6.6 Optional P6, client 0xB6A4D0, TeleportFailAck: log the two u32 at payload +5 and +9.
+
+Never hook these protected stubs: 0x2AC6390, 0x2BCD120, 0x3891B0, 0x2068340, 0x214E7A0, 0xA0DFA0, 0x91BA00, 0x91B0C0.
+
+7. IN-GAME TEST AND HOW TO READ IT
+
+1. At camp, press F9 next to Matilda.
+   - Expect "gate=1" and the type going 2, 1, 2, then her walking after you.
+   - Or "gate=0": then press vanilla Follow.
+2. Walk 30 s together, then run or ride more than 100 m until the teleport-out effect plays.
+3. Keep going 15 s, stop, and wait 15 s. If she is not back, press F10 and wait 10 s.
+4. Optional: press F9 next to Aldric (he is already in the list). This tests the event path on a second comrade.
+5. Send GreymaneCompanions.log.
+
+What the log means:
+- Actor lost or record changed, with a P4 line: distance logout (the leash failed or was not applied).
+- Actor lost or record changed, without a P4 line: spawner-missing or another logout. The 4.2 result line tells whether the re-summon worked.
+- Actor alive but jumped toward camp: her chart aimed at home (P5 confirms).
+- Actor alive but not moved:
+  - P1 without P2: a silent drop. Compare [a+0x90] with the player's user key.
+  - P2 with an error: InvalidAiOnceTimer means the sequence number moved on.
+  - No P1 and gate=1: look for a P3 line.
+- Near the player on the server but invisible in game: the client is out of sync with the server. F10 is the test.
+
+8. RISKS
+1. Raising events with gate=0 is avoided; what 0x2AC6390 does for a client-run AI is unknown.
+2. Re-summoning can fail, or leave a second Matilda at camp. An entry with actorKey 0 blocks client syncing until 4.2 removes it.
+3. The leash does not cover all logout paths (4.1).
+4. The rescue may place her badly or not reach the client. It is manual and capped.
+5. AccompanyMercenary clears the remembered list (clan+0xF0); keep the guard.
+6. Release builds: no research tools, link with /PDBALTPATH:%_PDB%, and grep the .asi for the user name.
+
+[UNVERIFIED] summary:
+- the Standby/Follow replay on the server, and the req+0x50 value
+- the kind enum offset, and the MercInfo +0x20 values
+- what removed Matilda (the sweep idea is not shown)
+- whether a Melee/Range re-summon succeeds
+- rescue centre and client sync
+- P5 argument roles
+- DisbandByKeys client sync
+- whether game timers pass through H0
+
+My helper scripts are in scratchpad\gca\wf2\plan3\ (qrefs.py, vcall.py, merc.py).

@@ -1,0 +1,263 @@
+FINDINGS:
+- [medium] Timing. On a client-run comrade the interaction's own event is raised inside the client's PreemptionStepSuccessAck handler. That ack is sent by TryPreempt itself, so it always precedes the plugin's 0x9FB. On the server, the event is raised later than TryPreempt.
+  TryPreempt sets comp+0x2A = 1 (0x2B37219) and sends the success ack through 0x29E7760 at 0x2B37309. It never calls vt+0x140.
+Client ack 0xBB4130 -> 0x9B6270 -> 0x9B7FC0 -> vt+0x140 with step 1 at 0x9B8264.
+MoveToTarget body 0xE3F61F0 (stub 0x211D740) sets step 2 and calls 0x211DA30 at once (0xE3F6433, 0xE3F6461).
+0x211DA30 raises pivot+0x64 only where target->vt[0x188](5) is true (0x211DD8C..0x211DEB9).
+Shared step function: vt+0x140 0x211D320 is in the Client, Common and Server InteractionActorComponent vtables (0x55BDC70, 0x5914AF8, 0x5B2AD40).
+The server DoStep 0x2B36B30 sets +0x2A = 3/4.
+Plugin log: 529-848 server messages/s.
+- [high] TryPreempt 0x2B36EF0 is the right hook. It is plain code with a unique AOB. Its only caller is the protected body of stub 0x2B36860, which the PreemptionStepReq handler 0x29E8FA0 reaches.
+  Bytes at 0x2B36EF0: 48 89 5C 24 10 66 44 89 4C 24 20 55 56 57 41 54 41 55 41 56 41 57 48 8D 6C 24 F9. This is a prologue, not E9, and it matches once across all sections (wf5\aobcheck.py).
+Caller: .xtls 0x1067B868 (wf5\allcallers.py).
+Arguments, checked against the caller at 0x1067B83D..0x1067B868 and the callee frame (rbp = entry rsp - 0x3F):
+- iidx is spilled at [rsp+0x20];
+- pivot [rbp+0x67], f5 [rbp+0x6F], f7 [rbp+0x77], out [rbp+0x7F];
+- returns rdx; *result = 0 on success (0x2B37313).
+The key to index lookup is in the caller: manager [base+0x6D69AB8], record+4 = key, record+8 = u16 index (0x1067B6BE..0x1067B761).
+GetII 0x3888B0 is a protected stub (-> .xtls 0x87E65F0), call-only; the game calls it at 0x2B36FAE.
+- [high] A Recruit record built this way parses cleanly. The pivot event f5bfee82 and the pivot+0x68 interactor chart key 0 are copied as-is, so the server's CanInteract per-pivot check is unchanged. The condition passes on the server's mode-3 recheck for a comrade with no entry.
+  wf5\make_recruit.py gives 388 bytes; iiparse consumes all of them.
+Target = ((!CheckDead @0x121 && (Acc==None @+0x12A || Acc==None @+0x12F)) && !CheckCCTime @0x132).
+The record is written to wf5\recruit_F5010.bin.
+TryPreempt runs vt+0x170 in mode 3 (0x2B37086), and the server clan has no entry, so the check returns 0.
+- [high] The 38 camp comrades' vanilla interaction lists contain neither Follow nor Standby. Test 4 must keep adding 0xF4251 and 0xF4253, both for Standby/Follow after recruiting and for the one-press fallback.
+  build_test.camp_comrades() over the characterinfo table. Every one of the 38 lists is the same 20 keys: Dead_Loot ... Npc_Dialog1/2 ... Propose, Npc_Hyosi_Add/Remove, Npc_Gift, Common_Inspect.
+
+DESIGN:
+1. THE RECORD (interactioninfo, DMM new_record)
+- Key 0xF5010 (1003536); stringKey "Npc_Greymane_Recruit". The highest game key is 0xF4391, and both the key and the name are free. Reserve 0xF5011 for Dismiss and 0xF5012 for the story Recruit.
+- Built from Npc_Order_Follow 0xF4251 as in build_test.recruit_interaction():
+  a) u32 key + text(name) replace the first 8 + 16 bytes.
+  b) The label LocString loc_string(0x60, 0xF4251, 4295040310444128) at Follow +0x1D becomes loc_string(0x60, EMPLOY 0xF4292, 4295319483318368), which is Employ's "Recruit". Both id strings are 16 characters.
+  c) The bytes 03 97 01 03 00 03 97 01 01 00 (Follow +0x123) become 03 97 01 00 00 03 97 01 00 00. Find them by this unique pattern.
+  d) Keep everything else: pivot key 'TempPivotKey_Npc_Order_Follow_1'; pivot+0x64 = 82 EE BF F5 (Follow event, file +0xC9 in the clone); pivot+0x68 = 0; player condition IntroComplete && InteractionDefault; category 0xC351; InteractionA; keyboardClickType 2; _onPreemptionSuccessAiEventKey 0x542905B0; showWhenTargeted 1.
+- Result: 388 bytes. Offsets in the clone: label @+0x21, condition @+0x105 (target @+0x11D, CheckAccompanyType arguments @+0x12A and +0x12F), event @+0xC9.
+- base64 (also in wf5\recruit_F5010.bin):
+EFAPABQAAABOcGNfR3JleW1hbmVfUmVjcnVpdAAAAAAABmAAAACSQg8AEAAAADQyOTUzMTk0ODMzMTgzNjgBAAAAHwAAAFRlbXBQaXZvdEtleV9OcGNfT3JkZXJfRm9sbG93XzEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD///////////////8AAAAAAAAAAAAAAAAAAAAAAAAAAAAAIEEAAABAAAAAwAAAAAAAAAAAAAAAAAAAAAAAAAAAgu6/9QAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgL8AAAAAAAAAAAAAAAAAAACAAAAAAAAAAIAAAAAAAQAAAAEBAQMJAVJCDwADCQFBQg8AAAABAQEBAgMQAAAAAAOXAQAAA5cBAAACAy8AAAAAAQAAAAAAAAAAAAAAAFHD4vQV/AACAAAAAAAAAACwBSlU+A6e9AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAA==
+- When it shows: the comrade's owner resolves (hired) and she has no clan+0xB8 entry, is not dead and not CC'd. It hides once she is in the list (type 1-4); vanilla Standby/Follow take over there.
+- Unowned NPCs: CheckAccompanyType returns 2 (0x22A4EEE), so the option hides.
+- AI event: keep f5bfee82.
+  - If the comrade is not yet registered, the filter drops it (0x400, flag 0x100000), so it cannot run without an entry.
+  - On the server it is raised after registration.
+  - On the client it may survive if the event is filtered at processing time after the 0x9FB. It costs nothing.
+  - Dismiss should set pivot+0x64 = 0 and let the plugin act.
+
+2. CATCHING THE CHOICE (H1 = MinHook on 0x2B36EF0)
+- AOB: 48 89 5C 24 10 66 44 89 4C 24 20 55 56 57 41 54 41 55 41 56 41 57 48 8D 6C 24 F9 (unique, plain prologue). Before hooking, check the known-build prologue bytes at the RVA.
+- typedef uint64_t (__fastcall *TryPreemptFn)(uint64_t self, uint64_t result, uint64_t target, uint64_t iidx, uint64_t pivot, uint64_t f5, uint64_t f7, uint64_t out). Forward all 8 arguments unchanged. In the original, self is the player's ServerInteractionActorComponent, [self+8] the player actor, target an Actor*, the low 16 bits of iidx the interaction index; pivot, f5, f7 and out are stack arguments 5-8.
+- Hook body:
+```
+r = orig(...);
+__try {
+  if (*(u32*)result != 0) return r;
+  u16 i = (u16)iidx;
+  u32 key = i == g_idx[RECRUIT] ? 0xF5010 : i == g_idx[DISMISS] ? 0xF5011
+          : (g_idx[RECRUIT] == 0xFFFF ? *(u32*)GetII(&i) : 0);
+  if (key != 0xF5010 && key != 0xF5011) return r;
+  if (R8(R64(target + 0x88) + 1) != 1) return r;   // character
+  Push({key,
+        playerKey = R32(R64(self + 8) + 0x60),
+        targetKey = R32(target + 0x60),
+        charIdx = R16(R64(R64(target + 0x68) + 0x20) + 0x30),
+        GetTickCount64()});   // 8-slot Interlocked ring
+} __except (1) {}
+return r;
+```
+- GetII 0x3888B0 is taken from the E8 at 0x2B36FAE (protected stub, call-only; the game calls it in this same function).
+- g_idx is filled once in the pump by reading the InteractionInfo manager *(base+0x6D69AB8):
+  1. If +0x6C == 0, skip.
+  2. bucket = key % [+0x68]; b = [+0x78] + (bucket << 8); n = [b].
+  3. For each pair at b + 8 + j*8: if key matches, slot = pair+4.
+  4. rec = [[+0x80] + slot*8]; require rec+4 == key; index = u16 at rec+8.
+  This is the same lookup as 0x1067B6BE..0x1067B761.
+- No game calls besides that optional GetII, and no locks, inside H1.
+- H0 (0x2773C20) change:
+```
+ret = g_dispatch(...);
+if (ring not empty && OnServerThread() && InterlockedCompareExchange(&g_busy, 1, 0) == 0)
+  { RunChoices(now); g_busy = 0; }
+return ret;
+```
+  Keep the existing drain at entry too. Post-original runs in the same server-loop context as the entry, with no game lock held, and it is the same dispatch that ran TryPreempt. Drop choices older than 5 s.
+
+3. THE PUMP: Recruit(choice), using existing game.cpp pieces
+a) Open(&c): player from choice.playerKey, owner, clan (vtable check), control, controlKey.
+b) charKey = CharKeyOfIndex(&choice.charIdx). Require NameOf(charKey) (roster), a clan+0x18 record with index == charIdx, merc != ~0 and actor != 0. Not owned: go to the story path (later).
+c) e = EntryOf(idx). If there is no entry: require RememberedClear (clan+0xF0 == 0), then Register(c, charKey), which is AccompanyMercenary 0x2150930 with {controlKey, charKey}. The entry gets type 2; 0x2B98830 re-arms her (0x21514A0 clears 0x100000) and sends 0x9FB. Re-read the entry: missing means fail, log and stop. Use e->actor.
+d) Leash(c, m): 0x28FA550(actor, 1e6) and save the old value.
+e) Ask(c, m): SetType(idx, 1) = 0x21523A0 + Ack 0x297EF40. This exact state then a Follow event is the proven sequence (Max). It also leaves vanilla Follow visible in the Ctrl menu as the fallback, and the change from 1 to 2 is the confirmation.
+f) gate = ServerRunsAi(actor):
+   - 1: RaiseEvent(c, actor, 0xF5BFEE82, "Follow") now. The entry exists and the flag is cleared. Retry up to MAX_TRIES at 1 s if the result is not 0.
+   - 0: do nothing. The client's own Follow from the record's pivot either survived (the type becomes 2 by itself) or it did not. Log "press Follow (Ctrl)" after 3 s, or hand her to the client-raise mechanism when it exists.
+g) Phase ASKED. The existing logic moves her to FOLLOWING when entry type == 2.
+- Do not use SetAccompanyType(2) to start her: it raises no event and the type is already 2.
+- The server step machine's own later raise is a harmless duplicate Follow.
+- Dismiss reuses H1 and the ring with key 0xF5011, dispatched to Dismiss() (other researcher).
+
+4. TEST 4 (build_test.py successor; DMM v3, no project files edited here)
+- NAME 'Greymane Companions Test 4', version 0.4.
+- interactioninfo intents:
+```
+[{'op': 'new_record', 'new_key': 0xF5010, 'label': 'Recruit (Greymane camp comrades)',
+  'template': {'key': 0xF5010, '_blob_fallback': True, '_blob_b64': <the base64 above, or built by recruit_record()>}}]
+```
+  Build it in code as in wf5\make_recruit.py: replace the name, label and the COND_OLD pattern with COND_NEW, and assert each pattern occurs exactly once.
+- characterinfo: for each of the 38 camp_comrades(), add_interactions(raw, [0xF5010, 0xF4251, 0xF4253]). The lists have the same 20 vanilla keys; the new key is appended after the existing count/keys and before the float distance.
+- Remove:
+  - Npc_Employ 0xF4292: hidden by !IsHiredMercenary on hired comrades; its event b87ec524 is undecoded.
+  - Npc_Order_Disband 0xF425B: needs CheckSameParty and player CheckBuffTag 0xC10DC139; its event goes to undecoded chart handler 0x21E.
+  - All TESTS story edits (way A/B records, drop sets 0x1360003/4, interactions 0xF5003/4, type bytes), to isolate the camp test. Uninstall Test 3 first.
+- Later, story Greymanes: record 0xF5012 copied from Npc_Employ (label already "Recruit"), pivot+0x64 b87ec524 set to 0, conditions as Employ. Plus the Test 3 type byte 0x46/0x47 and hire message. The plugin then does HireActor 0x2BADC00, then step 3 on the new actor.
+- What to check in game:
+  1. Ctrl near Morrow shows Recruit.
+  2. Press it; the log shows the H1 choice, AccompanyMercenary ok, type 1, the gate result, and whether type 2 arrives without a second press.
+  3. If not, vanilla Follow is there; pressing it gives type 2 and she follows.
+
+OPEN:
+- On a client-run comrade, the early Follow event is raised inside the PreemptionStepSuccessAck handler, before the 0x9FB. Is it filtered when it is raised (dropped, error 0x400) or later during the AI update, after the 0x9FB clears flag 0x100000 (survives)? Test 4 settles it: the type goes from 1 to 2 with no second press only if it survives. If it is dropped, a one-press start for client-run comrades needs the client-side event raise the other researcher is working on.
+- The Ctrl list layout is not decoded. The Recruit option is expected in the same place vanilla Follow appeared (InteractionA). That is an inference from field equality, not proven UI code.
+- Dismiss key slot: while she is in the list, Standby (InteractionB, types 2/3) and vanilla Follow (InteractionA, types 1/3) are both possible. Any Dismiss on A or B can share a slot with one of them. InteractionY is used only by Common_Inspect. How the UI handles two shown options on one slot is unknown.
+- Reusing Follow's pivot key string 'TempPivotKey_Npc_Order_Follow_1': Test 3's copies reused Dialog1's pivot key and the game loaded, but no global pivot-key lookup or override was checked.
+- For story Greymanes: the meaning of IsHiredMercenary's 5-byte body (00 00 00 00 01). Also whether HireActor's new actor can be registered straight away, or needs to wait until it has spawned (record+0x50 != 0).
+- Static evidence that the 0x21C Follow handler always calls AIFunction_SetAccompanyType is missing (the chart is not decoded). The 1 to 2 confirmation rests on the logged in-game change for Max (11:39:37.549).
+
+VERDICTS:
+- HOLDS: 1. Clone Npc_Order_Follow 0xF4251 (not Npc_Employ or Npc_Dialog1). Follow's record has the right shape and only bytes change.
+  Re-ran iiparse and make_recruit. Follow is 384 bytes and parses to the end.
+- Field offsets as claimed: type @+0x19 = 0, label @+0x1D, pivot list @+0x3A, condition @+0x105, category 0xC351 @+0x141, InteractionA @+0x143, kbd 2 @+0x148, showWhenTargeted @+0x176.
+- Npc_Dialog1: interactionType is 3 at +0x14.
+- Employ: !IsHiredMercenary leaf @+0x126.
+- The base64 decodes to the same 388 bytes as recruit_F5010.bin and parses to the end.
+- No 0xF4251 self-reference is left. The label id 4295319483318368 = (0xF4292<<32)|0x60 and has the same length as Follow's.
+- One new thing: the pivot key 'TempPivotKey_Npc_Order_Follow_1' becomes shared by two records. All 440 vanilla pivot keys are unique. Test 3 already loaded with 0xF5004/0xF5005 sharing 'TempPivotKey_Npc_Dialog1_1' (dist zip), so this is load-safe.
+- REFUTED: 2. Condition bytes: setting both CheckAccompanyType argument bytes to 00 gives 'not dead, not in the list, not CC'd'. On an unowned NPC the check retu
+  The bytes and the leaf logic hold:
+- 0x22A4E80 presets out = 0 at 0x22A4F5D and returns setne(out, arg) at 0x22A4F85..8C.
+- 0x21524C0 leaves out untouched and returns false when there is no entry (0x2152525). So argument 0 passes when there is no entry.
+
+The hiding rationale is wrong. The 'owner' path 0x17EF9C0 is the actor's FIELD owner, not a hirer:
+- field attacher via posComp vt+0x140 (0x17EF9F9);
+- user key [field+0x180] (0x17EFA95);
+- 0x206AE30 -> [user+0xD8].
+This resolves for any NPC in the player's field, hired or not. The same path is required by the server SetAccompanyType handler (0x2AC92A4), and that handler gave Max type 2 at camp.
+
+So Recruit also shows on UNHIRED camp comrades: Test 4 adds it to all 38. The 'returns 2' case is practically never reached.
+- HOLDS: 3. The Ctrl / more-options menu needs no extra flag; the clone keeps Follow's UI fields.
+  Field equality is confirmed: type 0, showUI 0, category 0xC351, keyboardClickType 2 and buttonClickType 0 for Follow, Standby and Employ. InteractionA = 0xFC15F4E2.
+
+The menu placement is inferred from vanilla Follow showing in game, not from UI code, which I did not trace.
+
+Caveat: these comrades' lists also hold other InteractionA options: Npc_Gift 0xB4 (gated by CheckKnowledge), Npc_Bind, Enemy_Mount and Dead_Catch.
+- If the UI shows one option per key, Recruit competes with Gift.
+- Vanilla Follow (A, appended after Gift) did show on Max and Matilda, so this is probably fine.
+- Verify with Gift available.
+- REFUTED: 4. An unlisted hired comrade carries flag 0x100000, so a Follow raised before registration is dropped (0x400). The re-arm and the 0x9FB clear the flag
+  Confirmed:
+- filter 0x2074D80..0x2074DA3 (bt 0x14 -> 0x400);
+- clearers 0x21514BD (0x1795490 clear), called at 0x2B98935 (server) and 0x9E4809 (client).
+
+Not established:
+- The setter is conditional. At 0x205A6A4..0x205A6B5 it sets bl=1 only if [[spawnInfo+0x10]+0x34] != 0; otherwise bl = the argument [rbp+0x148]. So it is not proven that camp (NPCSchedule) comrades carry the flag. Every logged flags value is post-registration (00000000).
+- The filter runs at PROCESSING time only. Its sole caller is 0x2073BB6 in 0x2073470, reached from the AI tick 0x207AB50 (0x207ADC7). The raise path 0x207AA10 -> 0x207AE20 -> 0x207AF20 only queues.
+
+So a pre-registration Follow may be dropped, may survive until after the 0x9FB, or may run because there is no flag. 'Cannot run without an entry' is not shown.
+
+Unowned NPCs never get the flag: the setter needs mercNo != -1 and idx != 0xFFFF (0x205A654..0x205A664).
+- HOLDS: 5. Without an entry SetAccompanyType fails silently (no Ack, err 0). Following starts only from the Follow handler, which sets type 2 itself.
+  0x2AC936C -> je 0x2AC93CE skips the Ack 0x297EF40 and writes [rdi] = 0.
+
+Log:
+- AccompanyMercenary leaves type 2 (11:39:25.862);
+- the plugin set type 1 at 11:39:26.582;
+- type became 2 at 11:39:37.549 after the vanilla Follow press, with no plugin write.
+
+That the handler is the writer is inferred: chart handler 0x21C is not decoded.
+- HOLDS: 6. Timing: on a client-run comrade the event is raised in the client's success-ack handler. TryPreempt sends that ack, so it precedes the plugin's 0x9
+  Confirmed:
+- comp+0x2A = 1 at 0x2B37219; ack via 0x29E7760 at 0x2B37309; *result = 0 at 0x2B37313.
+- The client ack calls 0x2125660 and then vt+0x140 (step 1) at 0x9B8264.
+- 0xE3F6433 (step 2) then 0x211DA30 at 0xE3F6461.
+- Raise is gated by target vt[0x188](5) (0x211DD8C..0x211DDAF).
+- 0x211D320 is in all three vtable slots 0x55BDC70 / 0x5914AF8 / 0x5B2AD40 (these are slot addresses, vtable+0x140).
+
+Refinement:
+- The vt+0x140 call inside 0x2125660's body (.xtls 0xE413142) is on [[actor+0x68]+0x40], not the interaction step.
+- The client raise only queues. The filter decides at the next AI tick, possibly after the 0x9FB.
+- HOLDS: 7. TryPreempt 0x2B36EF0 is the right hook: plain code, unique AOB, only caller is the protected body of stub 0x2B36860.
+  The AOB matches once across all sections.
+
+References, from E8/E9 and rel32-displacement scans of every section:
+- the only reference to 0x2B36EF0 is .xtls 0x1067B868, with no absolute pointers;
+- the stub 0x2B36860 is called only at 0x29E927D, inside 0x29E8FA0 (0x29E8FA0..0x29E9482).
+
+The first 5 bytes (48 89 5C 24 10) are relocatable. Argument roles are checked at 0x1067B83D..68 and the callee frame (rbp = entry-0x3F).
+
+The body reads the key as *(u32*)GetII(&idx) at 0x1067B7B6 and 0x1067B89C, so the fallback is right. GetII 0x3888B0 is a protected stub: call it only.
+
+The manager lookup matches 0x1067B6BE..0x1067B761. It also checks [+0x68] != 0 (0x1067B6CC..D3).
+- HOLDS: 8. The Recruit record parses cleanly, keeps pivot+0x64 f5bfee82 and pivot+0x68 = 0, and passes the server's mode-3 recheck for a comrade with no entry
+  388 bytes, parsed to the end.
+- Target tree: !CheckDead @0x121, Acc==None @+0x12A / +0x12F, !CCTime @0x132.
+- Event @0xC9; pivot+0x68 = 0.
+
+Mode-3 check: vt+0x170 with r9b=3 at 0x2B37079..86, then 'cmp [out],2' at 0x2B3708C. The caller presets out = 2 (0x1067B826) and the check leaves it at 2 when it passes. With no server entry CheckAccompanyType passes.
+
+The same is true for unhired NPCs (claim 2).
+- HOLDS: 9. The 38 camp comrades' vanilla lists contain neither Follow nor Standby, so Test 4 must keep adding 0xF4251 and 0xF4253.
+  Re-ran camp_comrades() and interaction_list(): 38 characters, all with the same 20 keys, and none is 0xF4251 or 0xF4253. Matilda's vanilla Standby/Follow in experiment 1 came from the Test 3 list additions.
+
+DESIGN REVIEW:
+Most of the design checks out, with 1 blocker and 1 high-severity race. I read the disassembly and the table bytes only. I wrote nothing.
+
+BLOCKER - the H1 'character' check drops every comrade:
+- `R8(R64(target+0x88)+1) != 1` keeps only kind 1, and kind 1 is Player.
+- The kind enum at 0x191640 is: 0 User, 1 Player, 3 NonPlayerCharacter, 4 Mercenary, 5 Vehicle, 6 Pet, 7 Gimmick.
+- Evidence:
+  - 0x2152C50 requires kind 1 plus [+0x96] for the leader.
+  - IsHiredMercenary's eval (.xtls 0xE7C99DC..0xE7C99F2) treats 4/5/6 as mercenary/vehicle/pet.
+  - 0x2B47473 checks kind 3 and then the characterinfo index.
+- A camp actor is kind 3; a summoned copy is likely kind 4. So every Recruit press is silently ignored.
+- Fix: accept kind 3 or 4, or drop the check and rely on the pump's roster and clan-record checks.
+
+HIGH - a race if the pump reuses Adopt / PHASE_START:
+- Today Ask (SetType 1) runs START_MS = 500 ms after registration, behind a 250 ms pump. The log shows a 720 ms gap.
+- For a client-run comrade, the client's own Follow is queued at ack time. It runs on the next AI tick, and its forwarded SetAccompanyType(2) can reach the server inside that window.
+- The late SetType(1) then overwrites type 2 with Wait, and she stands still. This is Max's fast-travel symptom.
+- Fix: do steps c, d and e in the same RunChoices call (H0 post-original), before any later client message is dispatched. Never go through PHASE_START for Recruit.
+
+MEDIUM - Recruit shows on unhired camp comrades:
+- CheckAccompanyType(None) resolves the leader from the field owner (0x17EF9C0), not from hiring.
+- On those NPCs the client step machine still raises f5bfee82. No 0x100000 flag protects them: the setter needs an owned record (0x205A654..0x205A664). The effect of chart handler 0x21C on an unhired NPC is unknown.
+- Do not 'fix' this with IsHiredMercenary(00 00 00 00 01) (the '<Me>' form): it returns fail (al=1 at 0xE7C9B97) for kind-3 actors and would hide Recruit on every camp comrade.
+- Options:
+  - Accept it, and have the pump log 'not hired'.
+  - Set pivot+0x64 = 0. This loses the client-side one-press chance.
+  - The character-key form of IsHiredMercenary in the PLAYER condition checks the player's clan (0xE7C9A89..), but needs one record per comrade.
+- If possible, test it once on an unhired comrade.
+
+LOW:
+1. The g_idx lookup must also skip when [+0x68] == 0 (division), as the game does at 0x1067B6CC. Retry until it resolves, not just 'once'.
+2. RaiseEvent's immediate result cannot show a 0x400 filter drop: the raise only queues, and the filter runs at processing time. The design already confirms through the type change to 2, so rely on that, not on retries.
+3. The Test 3 keys are 0xF5004/0xF5005 and drop sets 0x1360004/0x1360005, not .../3-4. Before uninstalling Test 3, make sure no story Greymane was hired through it.
+4. Renaming the shared pivot key is optional (claim 1).
+5. The user said follow should not have hotkeys. Test 4 should remove or disable F9; the design does not say so.
+6. The Ctrl-menu placement and the InteractionA sharing with Npc_Gift / Npc_Bind are verified only by vanilla Follow's in-game behaviour. Check it with Gift unlocked.
+7. For client-run comrades (the common case: Max's controller was 90100000), a one-press follow is still unproven. The vanilla Follow fallback stands.
+
+Safety checks that passed:
+- Record layout: no save-load risk found.
+  - The base64 equals recruit_F5010.bin, 388 bytes, and parses to the end.
+  - Only these change: the key, the name, the label id (same length) and two argument bytes.
+  - New-record and list edits have a load precedent in Test 3.
+- Unhiring: nothing in Test 4 can fire a comrade.
+  - Disband is removed.
+  - AccompanyMercenary runs only after the owned-record check.
+  - DisbandByKeys is only in Dismiss, which I did not review.
+- No protected stub is hooked.
+  - 0x2B36EF0 is plain code.
+  - GetII and 0x2AC6390 are call-only.
+  - 0x2B36EF0 is referenced only from 0x1067B868.
+- No clan calls run inside H1.
+  - H0 post-original has the same context as the proven pre-original drain.
+  - 0x2773C20 is a per-message dispatch called from 0x27735D3, and it releases its scopes before returning (0x27743DF..0x277442C).

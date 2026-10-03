@@ -1,0 +1,245 @@
+GREYMANE COMPANIONS: BUILD PLAN FOR THE NEXT VERSION (experiment 3)
+
+This plan comes from static research only. Nothing in it has run in game. "UNVERIFIED" marks anything that has no upheld static proof, or that depends on how the game behaves at run time. All RVAs are relative to base 0x140000000.
+
+1. HEALTH HUD ON F11
+
+1.1 Files
+- asi\src\overlay.cpp and overlay.h: a trimmed copy (about 450 lines) of DLLCrimson\CharacterCreator\CharacterCreator\overlay.cpp.
+  - Keep these parts of CC's file:
+    - the Present [8], Present1 [22] and SetColorSpace1 [38] detours, with the t_presenting guard (950-983)
+    - Identity, SameDevice and BufferIsOurs (406-429, 677-701, 378-384)
+    - Setup without HookWindow or WIC, keeping the DIRECT-queue check (279-371, 298-312)
+    - the composite path: COMPOSITE_HLSL, SetupComposite, PrepareImage and RenderComposite (513-787)
+    - TearDown, Follow and BeforePresent (857-947)
+    - HookSwapChainFunctions without ResizeBuffers (1113-1134)
+    - a minimal OnSwapChainCreated (1136-1166)
+    - CreateSystemFactory (1340-1365)
+  - Factory hook: take Seasons' table patch (Seasons asi\src\overlay.cpp, PatchSlot, TableCreateSwapChain and TableCreateSwapChainForHwnd, 1215-1268) and rewrite PatchSlot as a compare-and-swap loop (see 1.6).
+  - Drop:
+    - the window subclass and input code (105-191)
+    - ExecuteCommandLists and the queue list (40-49, 213-275, 995-1027)
+    - ResizeBuffers (985-993)
+    - RenderDirect and WIC
+    - FindFunctions (1031-1088)
+    - the diagnostics (1168-1335)
+    - SwapJump, HookCreationEntry and the guard thread (1367-1539)
+    - OverlayInit's fallback
+- asi\src\hud.cpp and hud.h: the panel drawing, ported from CC menu.cpp Style, MakeStyle, Font, Text and ForgetDrawing (1015-1208).
+  - Content: a panel gradient, a gold title, text and dim brushes, a bar background, a green bar, an amber DOWN bar, a red DEAD marker, and one Georgia font scaled by height/1080.
+  - ForgetDrawing must release every member. CC's version leaks st.note; do not copy that.
+- asi\src\health.cpp and health.h: the server-thread snapshot and the double buffer.
+- asi\shaders\composite.hlsl: compiled at build time with fxc /Fh into composite_vs.h and composite_ps.h. Do not load d3dcompiler_47 at run time.
+- asi\GreymaneCompanions.rc and version.h: add a VERSIONINFO resource. This is the antivirus lesson from CC 9.1.11.
+- GreymaneCompanions.vcxproj:
+  - add the new files;
+  - link d3d12, dxgi, d3d11, d2d1 and dwrite (or use #pragma comment, as Seasons overlay.cpp does at lines 14-18).
+- main.cpp:
+  - Start() creates an OverlayThread that does Sleep(1000), then OverlayEarlyInit().
+    - Not in DllMain, because the factory cannot be made under the loader lock.
+    - Not behind StartThread's 5 s sleep, because the game creates its swap chain 5.6-7.3 s after the plugins start (CC and Seasons logs).
+  - In KeyThread, KEY_HEALTH toggles the HUD. It already exists: F11, ini name "HealthWindow", hotkeys.cpp 21-26.
+
+1.2 What the HUD shows
+- Up to 8 rows: Damiane, then Oongka, then every comrade in g_comrades whose phase is not FREE (MAX_COMRADES = 4).
+- Each row has the name, an HP bar, "cur / max" (value / 1000, rounded) and a state marker:
+  - DEAD: R8(sc+0x273) != 0. The bar is empty and HP shows 0.
+  - DOWN: (s32)R32(sc+0x320) > 0, and not dead, and min > 0, and cur == min. Use the same rule for everyone.
+    - The claim that comrades die instead of going down was refuted. The HP floor comes from the UseGroggy buff (0x20A9E60 -> 0x1794FD0), which works on any actor, and Max knelt in game.
+  - "reviving": R8(sc+0x272) != 0. Server code checks this byte together with +0x273, and revive clears it at 0x2947260. Its meaning is UNVERIFIED.
+  - AWAY: the record's actor key (+0x50) is 0, or findActor fails.
+    - If R64(rec+0x58) > _time64(0) + R64(base+0x6C8CD80), add "back in m:ss".
+    - +0x58 is a "cannot summon before" time (0x2152636..0x2152658). It is not proof of death, so never label it DEAD.
+  - n/a: no HP entry was found, or max <= 0.
+- Damiane and Oongka (clan record index 4 and 6) are shown only when their record has an actor key and findActor finds that actor.
+- Skip the row whose actor key equals the character you control (key of [userActor+0xD8]); the game's own HUD already shows that one. Dedupe all rows by actor key.
+- Names come from the record index (4 = Damiane, 6 = Oongka) and from roster.h NameOf for comrades. Never take them from appearance data, because CC changes it.
+- The panel is not drawn when the HUD is off, when there are no rows, or when the snapshot is older than 2 s (loading screens, menus).
+
+1.3 Where the data is read
+- On the server thread, inside Run()'s __try in the existing dispatch hook (0x2773C20), every 250 ms (PUMP_MS), only while the HUD is on.
+- Put the call in Run() itself, not in PumpHeld: PumpHeld returns early when no comrade is looked after.
+- Per actor, one actor at a time, and only after ReadClan has released the clan owner lock:
+  ```
+  g_findActor(c->mgr, &s, key); actor = Held(&s);
+  if (actor && R64(actor+8)) { g_readLock(&lock, R64(actor+8)); /* reads */ Unlock(lock); }
+  g_scopeRelease(&s);
+  ```
+  - 0x393DF0 dereferences its argument without checking, hence the null checks.
+- Reads:
+  - sc = R64(R64(actor+0x68)+0x20): the StatusActorComponent, component id 4 (server vt 0x5B203F0).
+  - cont = R64(sc+0x18); arr = R64(cont+0x58); n = R32(cont+0x60), capped at 64. Null-check sc, cont and arr.
+  - Entry e = arr + i*0x90. Use the entry whose R16(e) == hpKey.
+  - cur = (s64)R64(e+8), max = (s64)R64(e+0x18), min = (s64)R64(e+0x28).
+  - hpKey = 0 (statusinfo row 0, "Hp").
+    - Optional runtime read: R16(R64(R64(R64(R64(base+0x6D69530))+8)+0x10)+0xA0). Null-check every hop and fall back to 0.
+    - That +0xA0 holds the HP key is inferred from the HP-ratio code 0x36748C..0x3674AA.
+  - Evidence: entry address 0x17ADD2F, count 0x17AA4CF, max 0x17AD842, min 0x17AD922, isDead 0x178DE20, groggy 0x17F6B00 -> 0x1794ED0, division by 1000 at 0x3674C5.
+- These are the same reads the game makes, under the same read lock (0x22DFDA9..0x22DFDE7). The server copy is the master: the server sends VaryHPAck 0x863 to the client.
+- Extend ReadClan's Record with s64 rec+0x58 and u16 rec+0x148 (rec+0x148 is also used in step 3).
+- Caveat: the hook only runs when a client-to-server message arrives (about 500 per second in play, 0-1 per second on loading screens). That is why the snapshot carries a time stamp and the 2 s stale rule.
+
+1.4 Handing the data to the render thread
+- Two buffers of {u32 version; ULONGLONG stamp; int count; Row rows[8]}, with Row = {wchar_t name[24] (always null-terminated); float hp, maxHp; u8 state; u16 backInSec}.
+- The server thread fills the back buffer, then publishes it with InterlockedExchange of the front index and version++.
+- The render thread copies the front buffer with a seqlock: read the version, copy, read the version again; retry once, otherwise keep its last copy.
+- The render thread never reads game memory, never calls the game and takes no game lock. A torn copy can only mix rows; it cannot crash.
+
+1.5 Render path
+- Use the composite path for every screen format: mode 0 for 8-bit UNORM, 1 for scRGB, 2 for HDR10 PQ at 203 nits, 3 for sRGB. This PC presents format 24 with colour space 12, so it uses mode 2.
+- Size the texture to the panel, not the screen. Set RSSetViewports to integer panel coordinates, with width and height equal to the texture size.
+- Redraw the texture with Direct2D only when the snapshot version, the generation or the size changes. Every other frame is: wrap the back buffer, render target view, one quad.
+- Set text antialiasing to GRAYSCALE, because the target is transparent.
+- Keep exactly one Flush, after the wrapped back buffer and its view are released (CC 781-785 / 499-502).
+  - The skeptic refuted the idea that this Flush is redundant. It is the one that drops D3D11's reference on the D3D12 back buffer. Without it, resizing or alt-tabbing crashes.
+  - Only the earlier Flush (776) may be merged away.
+- Position: left side, x = 24*s, y = 300*s, where s = height/1080.
+  - CC's panel uses the right-hand 624 px (at 1080 scale), from y 50 to height-50 (menu.cpp 1256-1264).
+  - Seasons' toast is in the top right.
+
+1.6 Living with Character Creator and Seasons
+- Factory hook: from the OverlayThread at +1 s, patch slots 10 and 15 of the System32 factory's table with compare-and-swap, between VirtualProtect(RW) and the restore:
+  ```
+  do { seen = vt[slot]; *orig = seen; } while (InterlockedCompareExchangePointer(&vt[slot], hook, seen) != seen);
+  ```
+  - CC and Seasons finish patching within about 0.2 s of start (CharacterCreator.previous.log lines 6-7 show them racing). The +1 s delay avoids both the slot race and the VirtualProtect race on the same page.
+- Swap chain hooks: MinHook Present, Present1 and SetColorSpace1 inside OnSwapChainCreated, exactly as CC and Seasons do.
+  - Two such chains already work together today (CC log lines 52-54, Seasons.log lines 70-72).
+  - Greymane's table entry is the outermost, so it hooks last, runs first and draws first. CC's and Seasons' menus therefore land on top of the HUD.
+- Greymane adds:
+  - no window subclass;
+  - no ResizeBuffers or ExecuteCommandLists hook;
+  - no change to code bytes that CC's guard watches (it only changes a table slot).
+- Hotkeys do not collide: Seasons F5, CC F6-F8, Greymane F10/F11. The keys are polled with GetAsyncKeyState, so F11 works even while CC's menu swallows key messages.
+- Always call the originals. Never hold a lock while calling the next function in a chain (CC holds its lock around ResizeBuffers, 985-993).
+- Rebuild detection:
+  - OnSwapChainCreated increments a creation counter.
+  - Every Present compares that counter, and g_creationQueue, with the drawing state and tears down when they differ. This runs even while the HUD is hidden.
+  - CC's test (pointer equality plus a 500 ms gap, 937/940) misses a new swap chain at a reused address, and CC's comment at 888-890 says drawing on the old queue crashed.
+- Setup checks:
+  - Draw only on a DIRECT queue, and only if Identity(queue->GetDevice) == Identity(swapChain->GetDevice). CC's fallback probe also creates swap chains through the factory (FindFunctions 1064).
+  - Mark the overlay as failed on any D3D11On12CreateDevice failure; CC 927 retries every frame.
+  - Ignore windows of class "CharacterCreatorProbe" and "SeasonsProbe".
+- If the SetColorSpace1 call was missed, fall back to IDXGIOutput6::GetDesc1().ColorSpace. Otherwise the HUD uses mode 0 on HDR10: wrong colours, but no crash.
+- When F11 is pressed but no swap chain was ever seen, log one line and draw nothing.
+
+1.7 Risks
+- Frame generation (DLSS-G, FSR FG): the HUD inherits CC's skip of non-DIRECT queues and other-device buffers, so it may stay hidden with frame generation on. UNVERIFIED.
+- The +1 s delay is enough on this PC; on slower PCs it is UNVERIFIED.
+- The game may already use F11 itself (photo mode or similar): UNVERIFIED. The key can be changed in the ini.
+- How a camp comrade dies is in protected code (0x1794440, 0x2946060). Whether he gets the mercenary death (record +0x50 cleared, +0x58 set) or a plain NPC death is UNVERIFIED.
+  - The plugin's existing Recover (game.cpp about 1160) re-registers a comrade whose actor vanished; today's log shows it at 12:00:37-39. After a death it might respawn him at once, or fail.
+  - Log what happens before changing Recover. The HUD itself changes no game state.
+- Release hygiene:
+  - Put HookProbes (game.cpp 1753) and the experiment logging behind GC_RESEARCH. The vcxproj has only Release|x64, so that macro has to be defined by hand.
+  - Grep the .asi for the user name before release.
+
+2. INSTANT FOLLOW WHEN A CLIENT RUNS THE AI
+
+What today's log shows (11:39): his accompany type became 2 at the moment of the press (11:39:37.549), but his AI sequence only changed at about 11:39:50. The order is accepted at once; he only acts on it after his current walk ends. The "retry every 1 s for up to 30 s" explanation was refuted. That leaves two separate fixes.
+
+2.1 No more talking to him (statically verified, high confidence)
+- The server's AI already forwards events to the controlling client:
+  - ServerAi vt+0x188 is the stub 0x2AC6390 -> .xtls 0x105CA330. Call it only, never hook it.
+  - When a client runs the AI, it sends TrocTrAiEventAck 0x8AA through 0x297C710, whose only caller is .xtls 0x105CA588.
+  - The client handler 0xB69040 queues the event on its own AI copy with 0x922680.
+- Changes in game.cpp:
+  - Start() (about line 1020) and SendFollow() (about line 1049): treat server == 0 exactly like server == 1.
+    - Raise Standby (0xEEBE079C), then Follow (0xF5BFEE82) FOLLOW_AFTER_WAIT_MS later.
+    - Use the existing RaiseEvent and the same request: 0x17B62A0, then 0x17B54D0, req+0x18 and req+0x1C = player key, req+0x50 = 0 (the vanilla value is unknown).
+  - RaiseEvent's success test (line 689) must tell three results apart:
+    - server-run and handled: res[0] == 0;
+    - forwarded to the client: res[0] == 1 && res[1] == 0 (0x105CA592 `mov qword [rsi],1`);
+    - error: otherwise (bit 1 set). Compare res[1] with the dword VALUE at base+0x6CF7A08 (eErrNoNotHaveController: the controlling user was not found).
+  - Keep Ask() as the fallback, but trigger it on the outcome rather than on the gate: if the type has not become 2 within 3 s of a forwarded Follow, ask the player as today. The client can drop the event (0xB6914F..0xB6915B, 0xB69249..0xB69253).
+  - Decide server-run or client-run with ServerRunsAi (vt[0x188](5) under the read lock), not with actor+0x90 alone.
+- Signature: `uint32_t* (__fastcall*)(uintptr_t serverAi, uint32_t res[4], uint8_t* req /*0xB0 bytes, 16-aligned*/, uint64_t arg5 = 0)`.
+
+2.2 Cutting the walk he is on (UNVERIFIED in game; behind a new ini switch, Interrupt = 0/1/2)
+When the pump sees the type turn 2 after a forwarded Follow (the chart sets it when it accepts the order), restart his client-side chart once.
+
+- Interrupt = 1 (primary): the game's own move-reject resync, 0x2BCCC00.
+  - Signature: `void (__fastcall*)(uintptr_t posComp, uint32_t err)`, with posComp = R64(R64(actor+0x68)+0x1A0). err is passed by value in edx: see the prologue at 0x2BCCC00 (`mov [rsp+0x10],edx`) and the vanilla call at 0x2978331..0x297833E.
+  - Take the address from the E8 at 0x297833E. Unique AOB: 89 54 24 10 55 53 56 57 48 8D AC 24 08 FF FF FF.
+  - It takes its own locks (0x2BCCC37, 0x2BCCC92, and the write lock at 0x2BCCD96), so hold none when calling it.
+  - It sends MoveForceNak 0xA5C and ChangeMoveSessionIDAck 0xC19 to the controlling client. The client (0xB61DE0 -> 0x9FF390) snaps him to his server position, restarts the chart (0x206EED0 at 0x9FF48A) and raises OnAi.
+  - It does nothing if posComp+0x3DC is set.
+  - err value: suggested is the dword at base+0x6CDD478 (eErrNoInvalidClientMovePosition). Which codes the validator 0x2BC5420 really returns is UNVERIFIED: they come from the callees of 0x2BCCEB0.
+- Interrupt = 2 (alternative): TrocTrChangeAiControlAck 0x9CC.
+  - u8 f[0x18], 8-aligned. Call 0x2A76060(f, actor) (a stub; take it from the E8 at 0x2BCCE1F).
+  - Then 0x297B430(actor, f) (from the E8 at 0x2C41553; AOB at 0x2C41538).
+  - Then set *(void**)f = base+0x5B253F8, as the game does.
+  - The client handler 0xB681F0 restarts the chart when [actor+0x90] equals its own user key, then raises OnAi.
+  - In vanilla only the cheat handler (0x98A) ever sends this, so its effect in normal play is untested. Never call 0x28FA4C0 or 0x28FBAC0.
+- After either one, raise Follow again 1 s later (forwarded), in case OnAi sent him back to his routine.
+- Interrupt = 0: do nothing. This is the release default until the switch is tested.
+- Server-run comrades (rare: every comrade in both logs was client-run): call 0x206EED0(serverAi, u32 r[2]) with no lock held (0x206EFB0 takes the write lock at 0x206F027), then raise Follow. This is a new use: the game only calls it on removal (0x2152185).
+
+2.3 What to log
+- Every RaiseEvent: res[0], res[1] and which side ran it.
+- The pump already logs the accompany type and ai+0x18 (AI sequence). Watch for the moment the type turns 2, and the moment the AI sequence and the distance change.
+- Probe P7, log only, behind GC_RESEARCH: MinHook on 0x207AF20.
+  - It is plain code with a unique 40-byte AOB: 48 89 5C 24 10 48 89 74 24 18 48 89 7C 24 20 55 41 54 41 55 41 56 41 57 48 8D 6C 24 B0 48 81 EC 50 01 00 00 45 0F B6 E1.
+  - After the original returns, if R32(R64(rcx+8)+0x60) is a tracked key, log:
+    - the hash R32(r8+4);
+    - res[0] and res[1];
+    - TLS+0x1EC (which side);
+    - whether it is a retry copy: R8(r8+0xA8) & 0x80 (not +0x48 as first reported).
+  - No game calls and no locks in the detour. Put SEH around the reads, and keep the tracked keys in a fixed array. It runs for every AI event on both threads, so keep it tiny.
+- Success: within about 1 s of F9, with no talking, the type is 2, the AI sequence changes and he moves toward the player.
+
+2.4 Risks
+- The OnAi raised after a restart may send a camp NPC back into his routine walk (Aldric showed "type 2 but not following" in Experiment 1). UNVERIFIED.
+- The resync snaps him to his last server position (a small jump) and starts a new move session.
+- The order of 0x8AA and the client's AI tick (0x8BE850) is not controlled; that is why Follow is sent again at +1 s.
+- All of these sends use the server thread's TLS send buffer (0x297B45B.., 0x297C735..). Call them only from the dispatch hook, never from KeyThread or the render thread.
+
+3. HORSES
+
+Verdict: no plugin fix yet. Do one cheap logging step in this version, then one data experiment, if the user wants to try it.
+
+What is known (upheld by the skeptic):
+- Comrades use the same AI chart as Damiane (0xA17A8F3E, picked at 0x206E833; the focus chart is used only while the player controls the actor). No riding chart is missing.
+- The server's call-vehicle path (FrameEventCallMercenaryReq 0x876 -> 0x2BA9950 -> 0x2BA9E70 -> 0x2BA71D0) looks for a clan record whose +0x148 equals the rider's character index (0x214C190, `cmp word [rax+0x148],bx` at 0x214C31E). If none exists it fails with eErrNoCantFindVehicleActor (0x2BA7312).
+- Among 7250 characterinfo records, only Damian (+0x100 -> 0xF46D5) and Oongka (-> 0xF46D4) have _ownedMercenaryCharacterInfo set (reader 0x14F0916). The comrades have no horse record.
+
+What is not known:
+- What tells a companion to call their horse. The claim "event 0xE697B0F0 starts MercenaryCallingVehiclePackage" was refuted: that hash is OnSequencer_NextPhase. The likely event is OnCallingVehicle 0x1813514E, but who raises it is unknown, and it may be limited to Mercenary_Main or playable mercenaries.
+- Whether the live horse records come from 0x2B9B330 at all, or from the kit drop sets DropSet_Damian_700003 (0xAAE63) and DropSet_Oongka_700004 (0xAAE64). Oongka's horse, mercNo 0x2AF, is older than Oongka himself (0x2B0).
+
+3.1 This version, logging only
+- ReadClan: copy u16 rec+0x148 and print it for horse records. Expected (UNVERIFIED): 0xF46D5 -> 3, 0xF46D4 -> 5, and Kliff's 0xF4E70 as a control.
+- For each comrade, log the actor kind R8(R64(actor+0x88)+1) and the mercenary component's owner key R32(R64(R64(actor+0x68)+0x118)+0x18).
+- Add Damiane's and the comrade's actor keys to P7's tracked keys, then mount a horse. Look for OnCallingVehicle 0x1813514E: which actor gets it, and on which side. That shows whether the riding trigger ever reaches a comrade.
+
+3.2 Next, a data experiment (a separate DMM test JSON, not the plugin; back up the save first)
+- Edit Max (0x280): at characterinfo record offset 0x160, change u32 0 to 0x000F47FF (Animal_UniqueNpc_Horse_4).
+  - That horse has the same mercenaryInfo 0x4E, vehicleInfo 0x4240 and AI chart 0x07758170 as Damiane's horse, and no drop set or other character uses it.
+  - Use a whole-record blob edit, as build_test.py does.
+  - Use Max rather than Matilda: Matilda's 0xF4C70 already has the Test 3 whole-record blob, and two whole-record blobs overwrite each other.
+- Check: after loading, a new clan record "character 0F47FF" should appear with +0x148 = Max's character index. Then make him follow, mount up, and see whether he calls and rides it.
+- If no record appears: the creator 0x2B9B330 is only reached indirectly (0x2BC6BB0 has no static callers). Try a fast travel or a reload.
+  - Do not make the plugin create the record: it is a SQL write (0x2778390).
+  - Do not call 0x2B9B330 directly: it rebuilds the party spawn list (0x2B9B8E3..0x2B9B9C7).
+- If the record appears but he does not ride: the trigger is gated somewhere else. Wait for the P7 result. Raising 0xE697B0F0 is rejected (it is a sequencer event, and the call would be on the wrong thread for a client-run AI).
+- Risks:
+  - the record is written through a SQL transaction (0x2778390) and stays in the save even after the mod is removed;
+  - the horse may show up in the stable UI (UNVERIFIED);
+  - if the live horses really come from drop sets, the characterinfo link may not be the path that matters.
+- A full rollout (one cloned horse character per comrade, with new keys plus characterappearanceindexinfo and charactergroupinfo rows) is premature.
+
+ORDER OF WORK
+1. The HUD (part 1) and the direct orders (2.1).
+2. The walk interrupt (2.2) behind its switch, together with P7.
+3. The horse logging (3.1) in the same build.
+4. The Max horse test (3.2) only after 3.1 shows the trigger can reach a comrade, or if the user wants to try it anyway.
+
+Files I checked (read only, nothing edited):
+- Desktop\Greymane Companions\asi\src\game.cpp
+- Desktop\Greymane Companions\asi\src\main.cpp
+- Desktop\Greymane Companions\asi\src\hotkeys.cpp
+- Desktop\DLLCrimson\CharacterCreator\CharacterCreator\overlay.cpp
+- Desktop\Seasons\asi\src\overlay.cpp
+- E:\SteamLibrary\steamapps\common\Crimson Desert\bin64\GreymaneCompanions\GreymaneCompanions.log
+
+Scratch file I wrote: scratchpad\gca\wf3\v2bcceb0_err.txt
